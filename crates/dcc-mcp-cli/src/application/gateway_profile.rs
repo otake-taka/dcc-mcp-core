@@ -59,6 +59,28 @@ impl GatewayTarget {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GatewayProfileDocument {
+    #[serde(default = "default_current")]
+    current: String,
+    #[serde(default)]
+    profiles: BTreeMap<String, GatewayProfileWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GatewayProfileWire {
+    base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedGatewaySelection {
+    pub store: GatewayProfileStore,
+    pub target: GatewayTarget,
+    pub token_file: Option<PathBuf>,
+}
+
 impl Default for GatewayProfileStore {
     fn default() -> Self {
         Self {
@@ -70,21 +92,10 @@ impl Default for GatewayProfileStore {
 
 impl GatewayProfileStore {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let Some(raw) = std::fs::read_to_string(path)
-            .optional()
-            .with_context(|| format!("reading gateway profile file {}", path.display()))?
-        else {
-            return Ok(Self::default());
-        };
-        if raw.trim().is_empty() {
-            return Ok(Self::default());
-        }
-        let mut store: Self = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing gateway profile file {}", path.display()))?;
-        if store.current.trim().is_empty() {
-            store.current = default_current();
-        }
-        Ok(store)
+        Ok(load_profile_document(path)?
+            .as_ref()
+            .map(store_from_document)
+            .unwrap_or_default())
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
@@ -92,9 +103,7 @@ impl GatewayProfileStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating gateway profile dir {}", parent.display()))?;
         }
-        let body = serde_json::to_string_pretty(self).context("serializing gateway profiles")?;
-        std::fs::write(path, format!("{body}\n"))
-            .with_context(|| format!("writing gateway profile file {}", path.display()))
+        save_profile_document(path, self, None)
     }
 
     pub fn register_remote(
@@ -176,11 +185,45 @@ impl GatewayProfileStore {
     }
 }
 
+pub(crate) fn load_and_resolve_selection(
+    path: &Path,
+    explicit_name: Option<&str>,
+    explicit_base_url: Option<&str>,
+) -> anyhow::Result<ResolvedGatewaySelection> {
+    let document = load_profile_document(path)?;
+    let store = document
+        .as_ref()
+        .map(store_from_document)
+        .unwrap_or_default();
+    let target = store.resolve(explicit_name, explicit_base_url)?;
+    let token_file = match (&document, &target) {
+        (Some(document), GatewayTarget::Remote { name, .. }) if name != "base-url" => document
+            .profiles
+            .get(name)
+            .and_then(|profile| profile.token_file.clone()),
+        _ => None,
+    };
+    Ok(ResolvedGatewaySelection {
+        store,
+        target,
+        token_file,
+    })
+}
+
 pub fn register_profile(path: &Path, name: String, url: String) -> anyhow::Result<Value> {
+    register_profile_with_token_file(path, name, url, None)
+}
+
+pub fn register_profile_with_token_file(
+    path: &Path,
+    name: String,
+    url: String,
+    token_file: Option<PathBuf>,
+) -> anyhow::Result<Value> {
     let mut store = GatewayProfileStore::load(path)?;
     let name = normalize_profile_name(name)?;
     let profile = store.register_remote(name.clone(), url)?;
-    store.save(path)?;
+    save_profile_document(path, &store, Some((&name, token_file)))?;
     Ok(json!({
         "registered": true,
         "name": name,
@@ -221,6 +264,89 @@ fn default_current() -> String {
     LOCAL_PROFILE_NAME.to_string()
 }
 
+fn load_profile_document(path: &Path) -> anyhow::Result<Option<GatewayProfileDocument>> {
+    let Some(raw) = std::fs::read_to_string(path)
+        .optional()
+        .with_context(|| format!("reading gateway profile file {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(&raw)
+        .map(Some)
+        .with_context(|| format!("parsing gateway profile file {}", path.display()))
+}
+
+fn store_from_document(document: &GatewayProfileDocument) -> GatewayProfileStore {
+    let current = if document.current.trim().is_empty() {
+        default_current()
+    } else {
+        document.current.clone()
+    };
+    GatewayProfileStore {
+        current,
+        profiles: document
+            .profiles
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name.clone(),
+                    GatewayProfile {
+                        base_url: profile.base_url.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn save_profile_document(
+    path: &Path,
+    store: &GatewayProfileStore,
+    token_override: Option<(&str, Option<PathBuf>)>,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating gateway profile dir {}", parent.display()))?;
+    }
+    let existing = load_profile_document(path)?.unwrap_or(GatewayProfileDocument {
+        current: default_current(),
+        profiles: BTreeMap::new(),
+    });
+    let profiles = store
+        .profiles
+        .iter()
+        .map(|(name, profile)| {
+            let token_file = token_override
+                .as_ref()
+                .filter(|(override_name, _)| *override_name == name)
+                .map(|(_, token_file)| token_file.clone())
+                .unwrap_or_else(|| {
+                    existing
+                        .profiles
+                        .get(name)
+                        .and_then(|profile| profile.token_file.clone())
+                });
+            (
+                name.clone(),
+                GatewayProfileWire {
+                    base_url: profile.base_url.clone(),
+                    token_file,
+                },
+            )
+        })
+        .collect();
+    let body = serde_json::to_string_pretty(&GatewayProfileDocument {
+        current: store.current.clone(),
+        profiles,
+    })
+    .context("serializing gateway profiles")?;
+    std::fs::write(path, format!("{body}\n"))
+        .with_context(|| format!("writing gateway profile file {}", path.display()))
+}
+
 fn normalize_profile_name(name: impl AsRef<str>) -> anyhow::Result<String> {
     let name = name.as_ref().trim();
     if name.is_empty() {
@@ -253,7 +379,7 @@ fn target_summary(target: &GatewayTarget) -> Value {
             "name": LOCAL_PROFILE_NAME,
             "mode": "local",
         }),
-        GatewayTarget::Remote { name, endpoint } => json!({
+        GatewayTarget::Remote { name, endpoint, .. } => json!({
             "current": name,
             "name": name,
             "mode": "remote",
@@ -298,7 +424,7 @@ mod tests {
             target,
             GatewayTarget::Remote {
                 name: "pcA".to_string(),
-                endpoint: Endpoint::new("https://example.com:19293")
+                endpoint: Endpoint::new("https://example.com:19293"),
             }
         );
     }
@@ -350,7 +476,7 @@ mod tests {
             target,
             GatewayTarget::Remote {
                 name: "base-url".to_string(),
-                endpoint: Endpoint::new("https://override.example:19293")
+                endpoint: Endpoint::new("https://override.example:19293"),
             }
         );
         assert_eq!(store.current, "pcA");
@@ -377,5 +503,83 @@ mod tests {
             value["profiles"][0]["base_url"],
             "https://example.com:19293"
         );
+    }
+
+    #[test]
+    fn old_profile_json_remains_compatible() {
+        let store: GatewayProfileStore = serde_json::from_value(json!({
+            "current": "pcA",
+            "profiles": {
+                "pcA": {"base_url": "https://example.com:19293"}
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(store.profiles["pcA"].base_url, "https://example.com:19293");
+    }
+
+    #[test]
+    fn remote_profile_persists_only_token_file_path_and_hides_it_from_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let token_file = dir.path().join("gateway.token");
+        register_profile_with_token_file(
+            &path,
+            "pcA".to_string(),
+            "https://example.com:19293".to_string(),
+            Some(token_file.clone()),
+        )
+        .unwrap();
+        let mut store = GatewayProfileStore::load(&path).unwrap();
+        store.set_current("pcA").unwrap();
+        store.save(&path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(token_file.to_string_lossy().as_ref()));
+        assert!(!raw.contains("studio-secret"));
+        let selection = load_and_resolve_selection(&path, None, None).unwrap();
+        let target = selection.target;
+        assert_eq!(selection.token_file, Some(token_file.clone()));
+        let summary = store.summary(&path, Some(&target));
+        assert!(
+            summary
+                .to_string()
+                .find(token_file.to_string_lossy().as_ref())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn selected_remote_endpoint_and_token_file_come_from_one_document_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        let original_token = dir.path().join("original.token");
+        let replacement_token = dir.path().join("replacement.token");
+        register_profile_with_token_file(
+            &path,
+            "studio".to_string(),
+            "https://original.example:19293".to_string(),
+            Some(original_token.clone()),
+        )
+        .unwrap();
+        set_current_profile(&path, "studio".to_string()).unwrap();
+
+        let selection = load_and_resolve_selection(&path, None, None).unwrap();
+        register_profile_with_token_file(
+            &path,
+            "studio".to_string(),
+            "https://replacement.example:19293".to_string(),
+            Some(replacement_token),
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection
+                .target
+                .endpoint_or_default("http://127.0.0.1:9765")
+                .base_url,
+            "https://original.example:19293"
+        );
+        assert_eq!(selection.token_file, Some(original_token));
     }
 }

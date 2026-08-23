@@ -8,6 +8,10 @@
 
 use serde_json::{Map, Value, json};
 
+mod health_schemas;
+
+use health_schemas::{gateway_health_schema, gateway_readyz_schema};
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GatewayOpenApiRoute {
@@ -577,15 +581,7 @@ fn gateway_schemas() -> Vec<(&'static str, Value)> {
                 "additionalProperties": true,
             }),
         ),
-        (
-            "GatewayHealth",
-            json!({
-                "type": "object",
-                "required": ["ok"],
-                "properties": {"ok": {"type": "boolean"}},
-                "additionalProperties": true,
-            }),
-        ),
+        gateway_health_schema(),
         (
             "GatewayInstance",
             json!({
@@ -690,62 +686,7 @@ fn gateway_schemas() -> Vec<(&'static str, Value)> {
                 },
             }),
         ),
-        (
-            "GatewayReadyz",
-            json!({
-                "type": "object",
-                "required": [
-                    "ok",
-                    "checks",
-                    "live_instance_count",
-                    "ready_instance_count",
-                    "not_ready_instance_count",
-                    "dispatch_reported_instance_count",
-                    "dispatch_ready_instance_count",
-                    "dispatch_not_ready_instance_count",
-                    "gateway_recovery_driver_counts",
-                    "registration_refresh_mode_counts",
-                    "gateway_daemon_guardian_instance_count",
-                    "gateway_daemon_guardian_ready",
-                    "instances"
-                ],
-                "properties": {
-                    "ok": {"type": "boolean"},
-                    "checks": {
-                        "type": "array",
-                        "items": {"type": "object", "additionalProperties": true}
-                    },
-                    "live_instance_count": {"type": "integer", "minimum": 0},
-                    "ready_instance_count": {"type": "integer", "minimum": 0},
-                    "not_ready_instance_count": {"type": "integer", "minimum": 0},
-                    "dispatch_reported_instance_count": {"type": "integer", "minimum": 0},
-                    "dispatch_ready_instance_count": {"type": "integer", "minimum": 0},
-                    "dispatch_not_ready_instance_count": {"type": "integer", "minimum": 0},
-                    "gateway_recovery_driver_counts": {
-                        "type": "object",
-                        "additionalProperties": {"type": "integer", "minimum": 0}
-                    },
-                    "registration_refresh_mode_counts": {
-                        "type": "object",
-                        "additionalProperties": {"type": "integer", "minimum": 0}
-                    },
-                    "gateway_daemon_guardian_instance_count": {"type": "integer", "minimum": 0},
-                    "gateway_daemon_guardian_ready": {"type": "boolean"},
-                    "gateway_lifecycle": {
-                        "type": "object",
-                        "properties": {
-                            "persist": {"type": "boolean"},
-                            "idle_timeout_secs": {"type": "integer", "minimum": 0}
-                        }
-                    },
-                    "instances": {
-                        "type": "array",
-                        "items": {"$ref": "#/components/schemas/GatewayInstance"}
-                    }
-                },
-                "additionalProperties": true,
-            }),
-        ),
+        gateway_readyz_schema(),
         (
             "GatewayUpdateCheckResponse",
             json!({
@@ -1331,6 +1272,18 @@ mod tests {
             assert!(
                 schemas.contains_key(schema),
                 "gateway OpenAPI schema set missing {schema}"
+            );
+        }
+        for schema in ["GatewayHealth", "GatewayReadyz"] {
+            assert!(
+                schemas[schema]["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&json!("auth_enabled"))),
+                "{schema} must require truthful auth_enabled readback"
+            );
+            assert_eq!(
+                schemas[schema]["properties"]["auth_enabled"]["type"],
+                "boolean"
             );
         }
     }

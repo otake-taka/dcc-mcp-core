@@ -6,7 +6,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use clap::Args;
-use dcc_mcp_gateway::{AdminPersistConfig, GatewayConfig, GatewayRunner, RelaySourceConfig};
+use dcc_mcp_gateway::{
+    AdminPersistConfig, GatewayAuth, GatewayAuthToken, GatewayConfig, GatewayRunner,
+    RelaySourceConfig,
+};
+use reqwest::header::HeaderValue;
 
 const DAEMONIZED_ENV: &str = "DCC_MCP__DAEMONIZED";
 
@@ -140,6 +144,17 @@ pub struct GatewayArgs {
     pub restart: bool,
 }
 
+/// Auth-aware CLI boundary for the machine-wide gateway process.
+#[derive(Debug, Args, Clone)]
+pub struct GatewayDaemonCliArgs {
+    #[command(flatten)]
+    pub gateway: GatewayArgs,
+
+    /// File containing the single bearer token accepted by gateway dispatch routes.
+    #[arg(long, env = "DCC_MCP_GATEWAY_AUTH_TOKEN_FILE", value_name = "PATH")]
+    pub auth_token_file: Option<PathBuf>,
+}
+
 /// Restart the gateway daemon by gracefully stopping the old process
 /// and spawning a new one.
 ///
@@ -155,10 +170,19 @@ pub struct GatewayArgs {
 /// Returns an error if no live process is found (use `gateway --daemon`
 /// to start fresh).
 pub async fn restart_gateway(args: &GatewayArgs) -> anyhow::Result<()> {
+    restart_gateway_with_auth(args, None).await
+}
+
+pub async fn restart_gateway_with_auth(
+    args: &GatewayArgs,
+    auth_token_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let pidfile = args
         .pidfile
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--restart requires --pidfile <PATH>"))?;
+    let validation_name = args.name.as_deref().unwrap_or("gateway-restart-validation");
+    try_build_gateway_config_with_auth(args, validation_name, auth_token_file)?;
 
     // ── 1. Read old PID ──────────────────────────────────────────────
     let old_pid = match dcc_mcp_gateway_ensure::read_pid_from_pidfile(Some(pidfile)) {
@@ -181,7 +205,7 @@ pub async fn restart_gateway(args: &GatewayArgs) -> anyhow::Result<()> {
         );
         let _ = std::fs::remove_file(pidfile);
         // Fall through to fresh start.
-        return restart_spawn_new(args).await;
+        return restart_spawn_new(args, auth_token_file).await;
     }
 
     eprintln!("Stopping gateway daemon (pid {old_pid})...");
@@ -201,11 +225,14 @@ pub async fn restart_gateway(args: &GatewayArgs) -> anyhow::Result<()> {
     }
 
     // ── 3. Spawn new detached gateway ───────────────────────────────
-    restart_spawn_new(args).await
+    restart_spawn_new(args, auth_token_file).await
 }
 
 /// Spawn the new detached gateway process and wait for it to become ready.
-async fn restart_spawn_new(args: &GatewayArgs) -> anyhow::Result<()> {
+async fn restart_spawn_new(
+    args: &GatewayArgs,
+    auth_token_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("cannot resolve current executable: {e}"))?;
 
@@ -264,6 +291,10 @@ async fn restart_spawn_new(args: &GatewayArgs) -> anyhow::Result<()> {
             rs.0.admin_url, rs.0.public_base_url
         )));
     }
+    if let Some(token_file) = auth_token_file {
+        child_args.push(std::ffi::OsString::from("--auth-token-file"));
+        child_args.push(std::ffi::OsString::from(token_file.as_os_str()));
+    }
 
     // Re-read pidfile after child daemonizes (child writes its new PID).
     let pidfile_path = args.pidfile.as_deref().unwrap(); // guaranteed Some by caller
@@ -312,12 +343,22 @@ fn push_arg(args: &mut Vec<std::ffi::OsString>, flag: &str, value: &str) {
 /// Extracted so the regression test can construct the exact same
 /// runtime configuration without invoking the blocking `run` loop.
 pub fn build_gateway_config(args: &GatewayArgs, gateway_name: &str) -> GatewayConfig {
+    try_build_gateway_config_with_auth(args, gateway_name, None)
+        .expect("building an unauthenticated gateway configuration")
+}
+
+pub fn try_build_gateway_config_with_auth(
+    args: &GatewayArgs,
+    gateway_name: &str,
+    auth_token_file: Option<&std::path::Path>,
+) -> anyhow::Result<GatewayConfig> {
     let admin_retention = std::env::var("DCC_MCP_GATEWAY_ADMIN_RETENTION_DAYS")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(30)
         .clamp(1, 3650);
-    GatewayConfig {
+    let auth = load_gateway_auth(auth_token_file)?;
+    Ok(GatewayConfig {
         host: args.host.clone(),
         gateway_port: args.port,
         remote_host: Some(args.remote_host.clone()),
@@ -353,13 +394,58 @@ pub fn build_gateway_config(args: &GatewayArgs, gateway_name: &str) -> GatewayCo
                 .ok()
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+        auth,
         ..GatewayConfig::default()
+    })
+}
+
+fn load_gateway_auth(token_file: Option<&std::path::Path>) -> anyhow::Result<GatewayAuth> {
+    let Some(path) = token_file else {
+        return Ok(GatewayAuth::disabled());
+    };
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        anyhow::anyhow!(
+            "reading gateway auth token file {}: {error}",
+            path.display()
+        )
+    })?;
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "gateway auth token file {} is empty after trimming whitespace",
+            path.display()
+        );
     }
+    if token.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        anyhow::bail!(
+            "gateway auth token file {} contains a value that cannot be used in an HTTP Authorization header",
+            path.display()
+        );
+    }
+    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+        anyhow::anyhow!(
+            "gateway auth token file {} contains a value that cannot be used in an HTTP Authorization header",
+            path.display()
+        )
+    })?;
+    Ok(GatewayAuth {
+        tokens: vec![GatewayAuthToken::any_dcc(token)],
+    })
 }
 
 /// Run the standalone gateway until a shutdown signal arrives (or the
 /// idle-timeout fires when no backends remain).
 pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
+    run_with_auth(args, None).await
+}
+
+pub async fn run_with_auth(
+    args: GatewayArgs,
+    auth_token_file: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let gateway_name = args.name.clone().unwrap_or_else(default_gateway_name);
+    let cfg = try_build_gateway_config_with_auth(&args, &gateway_name, auth_token_file.as_deref())?;
+
     // ── Daemonize if requested ────────────────────────────────────────────
     let _pidfile = if args.daemon || args.pidfile.is_some() {
         daemonize_gateway(&args)?
@@ -367,8 +453,6 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
         None
     };
 
-    let gateway_name = args.name.clone().unwrap_or_else(default_gateway_name);
-    let cfg = build_gateway_config(&args, &gateway_name);
     let runner =
         GatewayRunner::new(cfg).map_err(|err| anyhow::anyhow!("creating GatewayRunner: {err}"))?;
     let mut outcome = runner
@@ -935,5 +1019,70 @@ mod tests {
             err.to_string().contains("--restart requires --pidfile"),
             "error must mention --pidfile: {err}"
         );
+    }
+
+    fn auth_test_gateway_args() -> GatewayArgs {
+        GatewayArgs {
+            host: "127.0.0.1".to_string(),
+            port: 9765,
+            name: None,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 0,
+            registry_dir: None,
+            no_admin: true,
+            admin_path: "/admin".to_string(),
+            stale_timeout_secs: 30,
+            #[cfg(feature = "mdns")]
+            discover_mdns: false,
+            relay_sources: Vec::new(),
+            gateway_persist: false,
+            gateway_idle_timeout_secs: 30,
+            semantic_search_enabled: false,
+            daemon: false,
+            pidfile: None,
+            restart: false,
+        }
+    }
+
+    #[test]
+    fn gateway_config_loads_one_trimmed_any_dcc_token_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("gateway.token");
+        std::fs::write(&token_file, "  studio-secret\n").unwrap();
+        let args = auth_test_gateway_args();
+
+        let cfg =
+            try_build_gateway_config_with_auth(&args, "auth-test", Some(&token_file)).unwrap();
+
+        assert!(cfg.auth.is_enabled());
+        assert_eq!(cfg.auth.tokens.len(), 1);
+        assert_eq!(cfg.auth.tokens[0].allowed_dcc, None);
+        assert!(!format!("{:?}", cfg.auth.tokens[0]).contains("studio-secret"));
+    }
+
+    #[test]
+    fn gateway_config_rejects_missing_empty_and_invalid_token_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = auth_test_gateway_args();
+        assert!(
+            try_build_gateway_config_with_auth(
+                &args,
+                "auth-test",
+                Some(&dir.path().join("missing.token")),
+            )
+            .is_err()
+        );
+
+        let empty = dir.path().join("empty.token");
+        std::fs::write(&empty, " \n\t").unwrap();
+        assert!(try_build_gateway_config_with_auth(&args, "auth-test", Some(&empty)).is_err());
+
+        let invalid = dir.path().join("invalid.token");
+        std::fs::write(&invalid, "secret\0suffix").unwrap();
+        let error = try_build_gateway_config_with_auth(&args, "auth-test", Some(&invalid))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("secret"));
     }
 }

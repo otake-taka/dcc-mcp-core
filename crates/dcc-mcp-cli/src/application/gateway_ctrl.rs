@@ -49,6 +49,13 @@ pub struct GatewayStatus {
     pub cli_version: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedGatewayStatus {
+    #[serde(flatten)]
+    pub status: GatewayStatus,
+    pub auth_state: gateway_ensure::GatewayAuthState,
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayDaemonStartRequest {
     pub host: String,
@@ -88,10 +95,51 @@ pub enum GatewayDaemonRequest {
     Status(GatewayDaemonStatusRequest),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum GatewayDaemonAuthRequest {
+    Start {
+        start: GatewayDaemonStartRequest,
+        auth_token_file: Option<PathBuf>,
+    },
+    Restart {
+        start: GatewayDaemonStartRequest,
+        auth_token_file: Option<PathBuf>,
+        stop_timeout_secs: u64,
+    },
+}
+
+enum GatewayDaemonOperation {
+    Start {
+        start: GatewayDaemonStartRequest,
+        auth_token_file: Option<PathBuf>,
+    },
+    Restart {
+        start: GatewayDaemonStartRequest,
+        auth_token_file: Option<PathBuf>,
+        stop_timeout_secs: u64,
+    },
+    Stop(GatewayDaemonStopRequest),
+    Status(GatewayDaemonStatusRequest),
+}
+
 /// Start the gateway (ensure it's running; alias for `ensure`).
 pub async fn gateway_start(args: &GatewayCtrlArgs) -> anyhow::Result<gateway_ensure::EnsureResult> {
+    Ok(gateway_start_with_auth(args, None).await?.ensure)
+}
+
+pub async fn gateway_start_with_auth(
+    args: &GatewayCtrlArgs,
+    auth_token_file: Option<&std::path::Path>,
+) -> anyhow::Result<gateway_ensure::ManagedEnsureResult> {
+    let ensure_args = gateway_start_ensure_args(args)?;
+    gateway_ensure::ensure_gateway_running_with_auth(&ensure_args, auth_token_file).await
+}
+
+fn gateway_start_ensure_args(
+    args: &GatewayCtrlArgs,
+) -> anyhow::Result<gateway_ensure::EnsureGatewayArgs> {
     let start = args.start_opts.as_ref().context("start options required")?;
-    let ensure_args = gateway_ensure::EnsureGatewayArgs {
+    Ok(gateway_ensure::EnsureGatewayArgs {
         host: args.host.clone(),
         port: args.port,
         name: start.name.clone(),
@@ -102,8 +150,7 @@ pub async fn gateway_start(args: &GatewayCtrlArgs) -> anyhow::Result<gateway_ens
         gateway_bin: start.gateway_bin.clone(),
         wait_timeout_secs: start.wait_timeout_secs,
         pidfile: Some(args.pidfile.clone()),
-    };
-    gateway_ensure::ensure_gateway_running(&ensure_args).await
+    })
 }
 
 /// Stop the gateway by sending a termination signal to the PID recorded
@@ -190,6 +237,16 @@ pub async fn gateway_status(args: &GatewayCtrlArgs) -> GatewayStatus {
     }
 }
 
+pub async fn managed_gateway_status(args: &GatewayCtrlArgs) -> ManagedGatewayStatus {
+    let status = gateway_status(args).await;
+    let auth_state = if status.healthy {
+        gateway_ensure::gateway_auth_state(&args.host, args.port).await
+    } else {
+        gateway_ensure::GatewayAuthState::Unknown
+    };
+    ManagedGatewayStatus { status, auth_state }
+}
+
 fn resolve_gateway_pid(args: &GatewayCtrlArgs, healthy: bool) -> Option<u32> {
     resolve_gateway_pid_with(args, healthy, gateway_ensure::is_process_alive)
 }
@@ -226,41 +283,113 @@ fn live_gateway_sentinel_pid(
 }
 
 pub async fn run_gateway_daemon(request: GatewayDaemonRequest) -> anyhow::Result<Value> {
-    match request {
-        GatewayDaemonRequest::Start(start) => {
-            let args = start.into_ctrl_args();
-            Ok(serde_json::to_value(gateway_start(&args).await?)?)
-        }
+    let operation = match request {
+        GatewayDaemonRequest::Start(start) => GatewayDaemonOperation::Start {
+            start,
+            auth_token_file: None,
+        },
         GatewayDaemonRequest::Restart {
             start,
             stop_timeout_secs,
+        } => GatewayDaemonOperation::Restart {
+            start,
+            auth_token_file: None,
+            stop_timeout_secs,
+        },
+        GatewayDaemonRequest::Stop(stop) => GatewayDaemonOperation::Stop(stop),
+        GatewayDaemonRequest::Status(status) => GatewayDaemonOperation::Status(status),
+    };
+    run_gateway_daemon_operation(operation).await
+}
+
+pub(crate) async fn run_gateway_daemon_with_auth(
+    request: GatewayDaemonAuthRequest,
+) -> anyhow::Result<Value> {
+    let operation = match request {
+        GatewayDaemonAuthRequest::Start {
+            start,
+            auth_token_file,
+        } => GatewayDaemonOperation::Start {
+            start,
+            auth_token_file,
+        },
+        GatewayDaemonAuthRequest::Restart {
+            start,
+            auth_token_file,
+            stop_timeout_secs,
+        } => GatewayDaemonOperation::Restart {
+            start,
+            auth_token_file,
+            stop_timeout_secs,
+        },
+    };
+    run_gateway_daemon_operation(operation).await
+}
+
+async fn run_gateway_daemon_operation(operation: GatewayDaemonOperation) -> anyhow::Result<Value> {
+    match operation {
+        GatewayDaemonOperation::Start {
+            start,
+            auth_token_file,
         } => {
             let args = start.into_ctrl_args();
-            let stopped = gateway_stop(&args, stop_timeout_secs).await?;
-            let started = gateway_start(&args).await?;
-            Ok(serde_json::json!({
-                "restarted": true,
-                "stopped": stopped,
-                "started": started,
-            }))
+            Ok(serde_json::to_value(
+                gateway_start_with_auth(&args, auth_token_file.as_deref()).await?,
+            )?)
         }
-        GatewayDaemonRequest::Stop(stop) => {
+        GatewayDaemonOperation::Restart {
+            start,
+            auth_token_file,
+            stop_timeout_secs,
+        } => {
+            let args = start.into_ctrl_args();
+            restart_gateway_with_auth(&args, auth_token_file.as_deref(), stop_timeout_secs).await
+        }
+        GatewayDaemonOperation::Stop(stop) => {
             let args = gateway_ctrl_args(stop.host, stop.port, stop.registry_dir, None);
             Ok(serde_json::to_value(
                 gateway_stop(&args, stop.wait_timeout_secs).await?,
             )?)
         }
-        GatewayDaemonRequest::Status(status) => {
+        GatewayDaemonOperation::Status(status) => {
             let args = gateway_ctrl_args(status.host, status.port, status.registry_dir, None);
-            Ok(serde_json::to_value(gateway_status(&args).await)?)
+            Ok(serde_json::to_value(managed_gateway_status(&args).await)?)
         }
     }
+}
+
+async fn restart_gateway_with_auth(
+    args: &GatewayCtrlArgs,
+    auth_token_file: Option<&std::path::Path>,
+    stop_timeout_secs: u64,
+) -> anyhow::Result<Value> {
+    if let Some(path) = auth_token_file {
+        gateway_ensure::validate_auth_token_file(path)?;
+    }
+    reject_restart_auth_downgrade(args, auth_token_file).await?;
+    let stopped = gateway_stop(args, stop_timeout_secs).await?;
+    let started = gateway_start_with_auth(args, auth_token_file).await?;
+    Ok(serde_json::json!({
+        "restarted": true,
+        "stopped": stopped,
+        "started": started,
+    }))
 }
 
 pub async fn ensure_local_gateway_for_endpoint(
     endpoint: &Endpoint,
     gateway_bin: Option<PathBuf>,
     wait_timeout_secs: u64,
+) -> anyhow::Result<Option<gateway_ensure::EnsureResult>> {
+    ensure_local_gateway_for_endpoint_with_auth(endpoint, gateway_bin, wait_timeout_secs, None)
+        .await
+}
+
+pub(crate) async fn ensure_local_gateway_for_endpoint_with_auth(
+    endpoint: &Endpoint,
+    gateway_bin: Option<PathBuf>,
+    wait_timeout_secs: u64,
+    auth_token_file: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<gateway_ensure::EnsureResult>> {
     let Some((host, port)) = local_auto_gateway_target(endpoint) else {
         return Ok(None);
@@ -283,7 +412,11 @@ pub async fn ensure_local_gateway_for_endpoint(
         pidfile: Some(pidfile),
     };
 
-    Ok(Some(gateway_ensure::ensure_gateway_running(&args).await?))
+    Ok(Some(
+        gateway_ensure::ensure_gateway_running_with_auth(&args, auth_token_file)
+            .await?
+            .ensure,
+    ))
 }
 
 pub fn local_auto_gateway_target(endpoint: &Endpoint) -> Option<(String, u16)> {
@@ -438,6 +571,24 @@ impl GatewayDaemonStartRequest {
     }
 }
 
+async fn reject_restart_auth_downgrade(
+    args: &GatewayCtrlArgs,
+    auth_token_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let replacement_has_auth = auth_token_file.is_some();
+    if !replacement_has_auth
+        && gateway_ensure::gateway_auth_state(&args.host, args.port).await
+            == gateway_ensure::GatewayAuthState::Enabled
+    {
+        anyhow::bail!(
+            "refusing to restart auth-enabled gateway at {host}:{port} without --auth-token-file or DCC_MCP_GATEWAY_AUTH_TOKEN_FILE; the running process was not stopped",
+            host = args.host,
+            port = args.port,
+        );
+    }
+    Ok(())
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -457,6 +608,203 @@ fn env_u64(name: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use dcc_mcp_transport::discovery::file_registry::FileRegistry;
+
+    async fn spawn_health_document(body: serde_json::Value) -> (u16, tokio::task::JoinHandle<()>) {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, server)
+    }
+
+    fn restart_request(
+        port: u16,
+        registry_dir: PathBuf,
+        auth_token_file: Option<PathBuf>,
+    ) -> GatewayDaemonAuthRequest {
+        GatewayDaemonAuthRequest::Restart {
+            start: GatewayDaemonStartRequest {
+                host: "127.0.0.1".to_string(),
+                port,
+                name: None,
+                registry_dir: Some(registry_dir),
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 59765,
+                gateway_idle_timeout_secs: 0,
+                gateway_bin: None,
+                wait_timeout_secs: 1,
+            },
+            auth_token_file,
+            stop_timeout_secs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_invalid_replacement_auth_before_stopping_any_resident_mode() {
+        for auth_enabled in [true, false] {
+            let (port, server) = spawn_health_document(
+                serde_json::json!({"ok": true, "auth_enabled": auth_enabled}),
+            )
+            .await;
+            let registry = tempfile::tempdir().unwrap();
+            let unreadable = registry.path().join("unreadable");
+            std::fs::create_dir(&unreadable).unwrap();
+            let empty = registry.path().join("empty.token");
+            std::fs::write(&empty, " \n\t").unwrap();
+            let invalid = registry.path().join("invalid.token");
+            std::fs::write(&invalid, "two tokens").unwrap();
+            let invalid_header = registry.path().join("invalid-header.token");
+            std::fs::write(&invalid_header, b"bad\x7fvalue").unwrap();
+
+            for token_file in [
+                registry.path().join("missing.token"),
+                unreadable.clone(),
+                empty.clone(),
+                invalid.clone(),
+                invalid_header.clone(),
+            ] {
+                let error = run_gateway_daemon_with_auth(restart_request(
+                    port,
+                    registry.path().to_path_buf(),
+                    Some(token_file),
+                ))
+                .await
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("auth token file"), "{error}");
+                assert!(
+                    !error.contains("pidfile"),
+                    "invalid replacement must fail before stop handling: {error}"
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_status_reports_secret_free_auth_state() {
+        let (port, server) =
+            spawn_health_document(serde_json::json!({"ok": true, "auth_enabled": true})).await;
+        let registry = tempfile::tempdir().unwrap();
+        let args = gateway_ctrl_args(
+            "127.0.0.1".to_string(),
+            port,
+            Some(registry.path().to_path_buf()),
+            None,
+        );
+
+        let output = serde_json::to_value(managed_gateway_status(&args).await).unwrap();
+
+        assert_eq!(output["auth_state"], "enabled");
+        assert!(output.get("auth_token_file").is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_auth_downgrade_before_pidfile_or_stop_handling() {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({"ok": true, "auth_enabled": true}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let registry = tempfile::tempdir().unwrap();
+        let request = GatewayDaemonRequest::Restart {
+            start: GatewayDaemonStartRequest {
+                host: "127.0.0.1".to_string(),
+                port,
+                name: None,
+                registry_dir: Some(registry.path().to_path_buf()),
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 59765,
+                gateway_idle_timeout_secs: 0,
+                gateway_bin: None,
+                wait_timeout_secs: 1,
+            },
+            stop_timeout_secs: 1,
+        };
+
+        let error = run_gateway_daemon(request).await.unwrap_err().to_string();
+        assert!(error.contains("auth-enabled gateway"), "{error}");
+        assert!(error.contains("--auth-token-file"), "{error}");
+        assert!(
+            !error.contains("pidfile"),
+            "preflight must fail before stop: {error}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_auth_preflight_allows_disabled_and_legacy_health_documents() {
+        for body in [
+            serde_json::json!({"ok": true, "auth_enabled": false}),
+            serde_json::json!({"ok": true}),
+        ] {
+            let app = axum::Router::new().route(
+                "/health",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let request = GatewayDaemonStartRequest {
+                host: "127.0.0.1".to_string(),
+                port,
+                name: None,
+                registry_dir: None,
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 59765,
+                gateway_idle_timeout_secs: 0,
+                gateway_bin: None,
+                wait_timeout_secs: 1,
+            };
+
+            reject_restart_auth_downgrade(&request.into_ctrl_args(), None)
+                .await
+                .unwrap();
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn auth_aware_start_variant_keeps_path_outside_legacy_request_struct() {
+        let token_file = PathBuf::from("/run/secrets/dcc-mcp-gateway.token");
+        let request = GatewayDaemonStartRequest {
+            host: "127.0.0.1".to_string(),
+            port: 9765,
+            name: None,
+            registry_dir: None,
+            remote_host: "127.0.0.1".to_string(),
+            remote_port: 59765,
+            gateway_idle_timeout_secs: 0,
+            gateway_bin: None,
+            wait_timeout_secs: 1,
+        };
+        let request = GatewayDaemonAuthRequest::Start {
+            start: request,
+            auth_token_file: Some(token_file.clone()),
+        };
+
+        let GatewayDaemonAuthRequest::Start {
+            auth_token_file, ..
+        } = request
+        else {
+            panic!("expected auth-aware start request")
+        };
+        assert_eq!(auth_token_file.as_ref(), Some(&token_file));
+    }
 
     #[test]
     fn local_auto_gateway_target_accepts_loopback_http() {

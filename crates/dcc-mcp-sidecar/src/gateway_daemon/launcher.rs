@@ -351,13 +351,14 @@ fn spawn_detached_gateway_now(
 ) -> anyhow::Result<ensure::GatewayLaunchArtifacts> {
     let exe =
         std::env::current_exe().context("resolving current executable for detached gateway")?;
-    let cmd_args = ensure::gateway_command_args(
+    let cmd_args = ensure::gateway_command_args_with_auth(
         &opts.host,
         opts.port,
         opts.name.as_deref(),
         &opts.remote_host,
         opts.remote_port,
         opts.gateway_idle_timeout_secs,
+        None,
     );
     let mut context = ensure::GatewayLaunchContext::gateway(
         &opts.host,

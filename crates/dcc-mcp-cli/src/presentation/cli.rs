@@ -30,6 +30,7 @@ use crate::domain::rest::{
 };
 use crate::infra::http::HttpGateway;
 
+mod gateway_routing;
 mod image_artifacts;
 mod job_progress;
 mod lint;
@@ -37,6 +38,9 @@ mod marketplace_output;
 mod record_replay;
 mod ui_control_output;
 
+use gateway_routing::{ensure_gateway_for_command, resolve_gateway_credential_for_command};
+#[cfg(test)]
+use gateway_routing::{gateway_endpoint_for_command, gateway_target_uses_local_lifecycle};
 #[cfg(test)]
 use image_artifacts::{BASE64_STANDARD, MATERIALIZED_IMAGE_PLACEHOLDER, prune_image_artifacts};
 use image_artifacts::{default_image_artifact_root, materialize_call_images};
@@ -332,7 +336,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<GatewayAction>,
         #[command(flatten)]
-        daemon: dcc_mcp_sidecar::gateway_daemon::GatewayArgs,
+        daemon: dcc_mcp_sidecar::gateway_daemon::GatewayDaemonCliArgs,
     },
 }
 
@@ -427,6 +431,8 @@ struct GatewayStartArgs {
     remote_port: u16,
     #[arg(long, default_value = "0")]
     gateway_idle_timeout_secs: u64,
+    #[arg(long, env = "DCC_MCP_GATEWAY_AUTH_TOKEN_FILE", value_name = "PATH")]
+    auth_token_file: Option<PathBuf>,
     #[arg(long)]
     gateway_bin: Option<PathBuf>,
     #[arg(long, default_value = "30")]
@@ -472,6 +478,9 @@ enum GatewayAction {
         /// Profile name to store.
         #[arg(long)]
         name: String,
+        /// Local file containing the remote gateway bearer token.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
     },
     /// List configured remote gateway profiles and the active selection.
     List,
@@ -566,16 +575,33 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
     }
 
     let profile_path = gateway_profile::default_profile_path();
-    let profile_store = gateway_profile::GatewayProfileStore::load(&profile_path)?;
-    let gateway_target = profile_store.resolve(gateway.as_deref(), base_url.as_deref())?;
+    let selection = gateway_profile::load_and_resolve_selection(
+        &profile_path,
+        gateway.as_deref(),
+        base_url.as_deref(),
+    )?;
+    let profile_store = selection.store;
+    let gateway_target = selection.target;
     let endpoint = gateway_target.endpoint_or_default(DEFAULT_BASE_URL);
     let base_url = endpoint.base_url.clone();
-    let control = DccControlPlane::new(
-        gateway_target.clone(),
+    let control_target = if matches!(&command, Command::Gateway { .. }) {
+        GatewayTarget::Local
+    } else {
+        gateway_target.clone()
+    };
+    let token_file = resolve_gateway_credential_for_command(
+        &base_url,
+        &command,
+        &gateway_target,
+        selection.token_file,
+    )?;
+    let control = DccControlPlane::with_auth_token_file(
+        control_target,
         endpoint.clone(),
         gateway_ensure::default_registry_dir(),
         require_gateway,
-    )
+        token_file.as_deref(),
+    )?
     .with_auto_gateway_enabled(!no_auto_gateway);
     if !no_auto_gateway {
         ensure_gateway_for_command(
@@ -584,6 +610,7 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
             &gateway_target,
             auto_gateway_bin.clone(),
             auto_gateway_timeout_secs,
+            token_file.as_deref(),
         )
         .await?;
     }
@@ -598,15 +625,18 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
             timeout_secs,
         } => {
             let effective_timeout = global_timeout_secs.unwrap_or(timeout_secs);
+            let timeout = Duration::from_secs(effective_timeout.max(1));
             let endpoint = url
                 .as_deref()
                 .map(Endpoint::from_mcp_url)
                 .unwrap_or_else(|| Endpoint::new(&base_url));
             let mcp_url = url.as_ref().map(|raw| endpoint_for_mcp(raw));
-            let client = DccMcpClient::with_gateway(
-                endpoint,
-                HttpGateway::with_timeout(Duration::from_secs(effective_timeout.max(1))),
-            );
+            let gateway = if url.is_some() {
+                HttpGateway::build(timeout, None)?
+            } else {
+                control.http_gateway_with_timeout(timeout)?
+            };
+            let client = DccMcpClient::with_gateway(endpoint, gateway);
             let result = client.smoke(mcp_url, query, limit).await;
             failed = !result.get("ok").and_then(Value::as_bool).unwrap_or(false);
             if failed {
@@ -615,7 +645,7 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
             result
         }
         Command::Health => {
-            let client = DccMcpClient::new(endpoint.clone());
+            let client = control.client_with_timeout(Duration::from_secs(30))?;
             client.health().await?
         }
         Command::Stats {
@@ -817,8 +847,7 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
             }
         }
         Command::RecordReplay { action } => {
-            let result =
-                run_record_replay(action, agent_session_id.as_deref(), &endpoint, &control).await?;
+            let result = run_record_replay(action, agent_session_id.as_deref(), &control).await?;
             failed = result.failed;
             if failed {
                 exit_code = ExitCode::GeneralError;
@@ -1088,10 +1117,18 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
             if let Some(action) = action {
                 to_json(run_gateway_cmd(&base_url, action, &profile_path).await?)?
             } else {
-                if daemon.restart {
-                    dcc_mcp_sidecar::gateway_daemon::restart_gateway(&daemon).await?;
+                if daemon.gateway.restart {
+                    dcc_mcp_sidecar::gateway_daemon::restart_gateway_with_auth(
+                        &daemon.gateway,
+                        daemon.auth_token_file.as_deref(),
+                    )
+                    .await?;
                 } else {
-                    dcc_mcp_sidecar::gateway_daemon::run(daemon).await?;
+                    dcc_mcp_sidecar::gateway_daemon::run_with_auth(
+                        daemon.gateway,
+                        daemon.auth_token_file,
+                    )
+                    .await?;
                 }
                 return Ok(());
             }
@@ -1126,95 +1163,22 @@ async fn run_with_args(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn ensure_gateway_for_command(
-    base_url: &str,
-    command: &Command,
-    gateway_target: &GatewayTarget,
-    gateway_bin: Option<PathBuf>,
-    wait_timeout_secs: u64,
-) -> anyhow::Result<()> {
-    let Some(endpoint) = gateway_endpoint_for_command(base_url, command, gateway_target) else {
-        return Ok(());
-    };
-    let Some(result) =
-        gateway_ctrl::ensure_local_gateway_for_endpoint(&endpoint, gateway_bin, wait_timeout_secs)
-            .await?
-    else {
-        return Ok(());
-    };
-
-    if !result.already_running {
-        if let Some(pid) = result.pid {
-            eprintln!(
-                "info: auto-started gateway at http://{}:{} (pid {pid})",
-                result.host, result.port
-            );
-        } else {
-            eprintln!(
-                "info: auto-started gateway at http://{}:{}",
-                result.host, result.port
-            );
-        }
-    }
-    Ok(())
-}
-
-fn gateway_endpoint_for_command(
-    base_url: &str,
-    command: &Command,
-    _gateway_target: &GatewayTarget,
-) -> Option<Endpoint> {
-    match command {
-        Command::Smoke { url: None, .. } => Some(Endpoint::new(base_url)),
-        Command::Smoke { url: Some(_), .. } => None,
-        Command::Health | Command::Stats { .. } | Command::Update { .. } => {
-            Some(Endpoint::new(base_url))
-        }
-        Command::Doctor { .. } | Command::DccTypes { .. } => None,
-        Command::List
-        | Command::Search { .. }
-        | Command::Describe { .. }
-        | Command::LoadSkill { .. }
-        | Command::Call { .. }
-        | Command::CallBatch { .. }
-        | Command::UiControl { .. }
-        | Command::RecordReplay { .. }
-        | Command::WaitReady { .. }
-        | Command::ReloadSkills { .. }
-        | Command::StopInstance { .. } => Some(Endpoint::new(base_url)),
-        Command::Marketplace {
-            action: MarketplaceAction::Install { reload: true, .. },
-        }
-        | Command::Marketplace {
-            action: MarketplaceAction::Uninstall { reload: true, .. },
-        } => Some(Endpoint::new(base_url)),
-        // Local mode still executes these commands through FileRegistry/direct
-        // MCP where that is the richer path, but the CLI owns gateway
-        // lifecycle by default so agents can rely on the admin/control plane.
-        Command::Install { .. }
-        | Command::Marketplace { .. }
-        | Command::Lint(_)
-        | Command::Components { .. }
-        | Command::Gateway { .. } => None,
-    }
-}
-
 async fn run_gateway_cmd(
     _base_url: &str,
     action: GatewayAction,
     profile_path: &std::path::Path,
 ) -> anyhow::Result<Value> {
     match action {
-        GatewayAction::Register { url, name } => {
-            gateway_profile::register_profile(profile_path, name, url)
-        }
+        GatewayAction::Register {
+            url,
+            name,
+            token_file,
+        } => gateway_profile::register_profile_with_token_file(profile_path, name, url, token_file),
         GatewayAction::List => gateway_profile::list_profiles(profile_path),
         GatewayAction::Set { name } => gateway_profile::set_current_profile(profile_path, name),
-        GatewayAction::Daemon { action } => {
-            gateway_ctrl::run_gateway_daemon(gateway_daemon_request(action)).await
-        }
+        GatewayAction::Daemon { action } => run_gateway_daemon_action(action).await,
         GatewayAction::Ensure(args) => {
-            let request = gateway_ctrl::GatewayDaemonStartRequest::from(args);
+            let (request, auth_token_file) = gateway_start_request(args);
             let reg = request
                 .registry_dir
                 .clone()
@@ -1231,12 +1195,20 @@ async fn run_gateway_cmd(
                 wait_timeout_secs: request.wait_timeout_secs,
                 pidfile: None,
             };
-            let result = gateway_ensure::ensure_gateway_running(&args).await?;
+            let result =
+                gateway_ensure::ensure_gateway_running_with_auth(&args, auth_token_file.as_deref())
+                    .await?;
             Ok(serde_json::to_value(result)?)
         }
         GatewayAction::Start(args) => {
-            gateway_ctrl::run_gateway_daemon(gateway_ctrl::GatewayDaemonRequest::Start(args.into()))
-                .await
+            let (start, auth_token_file) = gateway_start_request(args);
+            gateway_ctrl::run_gateway_daemon_with_auth(
+                gateway_ctrl::GatewayDaemonAuthRequest::Start {
+                    start,
+                    auth_token_file,
+                },
+            )
+            .await
         }
         GatewayAction::Stop(args) => {
             gateway_ctrl::run_gateway_daemon(gateway_ctrl::GatewayDaemonRequest::Stop(args.into()))
@@ -1251,23 +1223,48 @@ async fn run_gateway_cmd(
     }
 }
 
-fn gateway_daemon_request(action: GatewayDaemonAction) -> gateway_ctrl::GatewayDaemonRequest {
+async fn run_gateway_daemon_action(action: GatewayDaemonAction) -> anyhow::Result<Value> {
     match action {
-        GatewayDaemonAction::Start(args) => gateway_ctrl::GatewayDaemonRequest::Start(args.into()),
-        GatewayDaemonAction::Restart(args) => gateway_ctrl::GatewayDaemonRequest::Restart {
-            start: args.start.into(),
-            stop_timeout_secs: args.stop_timeout_secs,
-        },
-        GatewayDaemonAction::Stop(args) => gateway_ctrl::GatewayDaemonRequest::Stop(args.into()),
+        GatewayDaemonAction::Start(args) => {
+            let (start, auth_token_file) = gateway_start_request(args);
+            gateway_ctrl::run_gateway_daemon_with_auth(
+                gateway_ctrl::GatewayDaemonAuthRequest::Start {
+                    start,
+                    auth_token_file,
+                },
+            )
+            .await
+        }
+        GatewayDaemonAction::Restart(args) => {
+            let (start, auth_token_file) = gateway_start_request(args.start);
+            gateway_ctrl::run_gateway_daemon_with_auth(
+                gateway_ctrl::GatewayDaemonAuthRequest::Restart {
+                    start,
+                    auth_token_file,
+                    stop_timeout_secs: args.stop_timeout_secs,
+                },
+            )
+            .await
+        }
+        GatewayDaemonAction::Stop(args) => {
+            gateway_ctrl::run_gateway_daemon(gateway_ctrl::GatewayDaemonRequest::Stop(args.into()))
+                .await
+        }
         GatewayDaemonAction::Status(args) => {
-            gateway_ctrl::GatewayDaemonRequest::Status(args.into())
+            gateway_ctrl::run_gateway_daemon(gateway_ctrl::GatewayDaemonRequest::Status(
+                args.into(),
+            ))
+            .await
         }
     }
 }
 
-impl From<GatewayStartArgs> for gateway_ctrl::GatewayDaemonStartRequest {
-    fn from(args: GatewayStartArgs) -> Self {
-        Self {
+fn gateway_start_request(
+    args: GatewayStartArgs,
+) -> (gateway_ctrl::GatewayDaemonStartRequest, Option<PathBuf>) {
+    let auth_token_file = args.auth_token_file;
+    (
+        gateway_ctrl::GatewayDaemonStartRequest {
             host: args.host,
             port: args.port,
             name: args.name,
@@ -1277,8 +1274,9 @@ impl From<GatewayStartArgs> for gateway_ctrl::GatewayDaemonStartRequest {
             gateway_idle_timeout_secs: args.gateway_idle_timeout_secs,
             gateway_bin: args.gateway_bin,
             wait_timeout_secs: args.wait_timeout_secs,
-        }
-    }
+        },
+        auth_token_file,
+    )
 }
 
 impl From<GatewayStopArgs> for gateway_ctrl::GatewayDaemonStopRequest {

@@ -152,6 +152,7 @@ variable):
 | `--gateway-idle-timeout-secs` | `DCC_MCP_GATEWAY_IDLE_TIMEOUT_SECS` | `30` |
 | `--discover-mdns` | `DCC_MCP_DISCOVER_MDNS` | `false` when built with `mdns` |
 | `--relay-source ADMIN_URL=PUBLIC_BASE_URL` | `DCC_MCP_RELAY_SOURCES` | none |
+| `--auth-token-file PATH` | `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE` | auth disabled |
 
 Additional environment knobs:
 
@@ -1238,6 +1239,33 @@ that boundary.
 
 ### Authentication: bearer tokens for registration and backend dispatch
 
+The operational daemon accepts one optional token file:
+
+```bash
+dcc-mcp-server gateway --host 0.0.0.0 --port 9765 \
+    --auth-token-file /run/secrets/dcc-mcp-gateway.token
+```
+
+`DCC_MCP_GATEWAY_AUTH_TOKEN_FILE` is the equivalent environment setting. The
+daemon reads the file before daemonising or replacing a running daemon, trims
+outer whitespace, and constructs one `GatewayAuthToken::any_dcc`. A missing,
+unreadable, empty, or HTTP-header-invalid value is a visible startup failure.
+Only the path may appear in a local spawn argv; the token value never belongs
+in argv, manifests, profiles, output, logs, or `Debug`.
+
+`GET /health`, `GET /v1/healthz`, and `GET /v1/readyz` remain public for
+guardian/ensure operation. Their documents expose `auth_enabled: true|false`
+so operators can verify configuration. This boolean does not authenticate or
+authorize the caller.
+
+Managed start/ensure never treats an arbitrary healthy 2xx resident as a
+matching launch. It compares requested auth mode with `auth_enabled`; only
+enabled/enabled, disabled/disabled, and legacy-unknown/no-auth are compatible.
+Managed restart validates the replacement token file before stopping the old
+process, so a missing, unreadable, empty, or invalid replacement cannot stop an
+auth-enabled or auth-disabled resident. Status and managed ensure expose only
+the tri-state `auth_state`, never a token value or token-file path.
+
 The Rust API exposes
 [`dcc_mcp_gateway::GatewayAuth`](https://docs.rs/dcc-mcp-gateway) and
 [`dcc_mcp_gateway::GatewayAuthToken`](https://docs.rs/dcc-mcp-gateway).
@@ -1265,6 +1293,13 @@ By default `GatewayAuth::disabled()` is used, which preserves the
 historical zero-auth behaviour and remains the safe default for the
 single-workstation daemon-backed auto-gateway (Recipe 1 in the topology
 section).
+
+The remote HTTP adapter-registration credential producer is not implemented in
+this slice. An adapter that uses `POST /v1/instances/register` against an
+auth-enabled daemon still needs a separately designed producer that reads and
+sends its registration credential. Do not qualify that topology as operational
+authentication until this exact gap is closed; gateway call credentials must
+not be repurposed or forwarded as backend credentials.
 
 ### Wire format
 
@@ -1367,8 +1402,8 @@ contract; the current gateway does not provide a second credential lane.
 
 - TLS terminated by a reverse proxy in front of the daemon — never bind
   the daemon directly to a public interface.
-- Bearer tokens stored as secrets (env var, secrets manager, mounted
-  file) and never passed via process argv.
+- Bearer token values stored in a mounted secret file and never passed via
+  process argv; only `--auth-token-file PATH` may appear there.
 - `allowed_dcc` scope on every token unless one truly needs a master
   token for bootstrap.
 - `AuditMiddleware` enabled so register / deregister / relay-attach

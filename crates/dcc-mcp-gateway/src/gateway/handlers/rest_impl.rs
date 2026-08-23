@@ -33,8 +33,12 @@ pub struct DccInstanceDescribeQuery {
 }
 
 /// `GET /health` — simple liveness probe.
-pub async fn handle_health() -> impl IntoResponse {
-    Json(json!({"ok": true, "service": "dcc-mcp-gateway"}))
+pub async fn handle_health(State(gs): State<GatewayState>) -> impl IntoResponse {
+    Json(json!({
+        "ok": true,
+        "service": "dcc-mcp-gateway",
+        "auth_enabled": gs.auth.is_enabled(),
+    }))
 }
 
 /// `POST /gateway/yield` — ask this gateway to voluntarily release its port.
@@ -292,8 +296,11 @@ pub async fn handle_v1_instance_context(
 // ── REST endpoints ────────────────────────────────────────────────────────
 
 /// `GET /v1/healthz` — REST liveness probe compatible with dcc-mcp-skill-rest.
-pub async fn handle_v1_healthz() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"ok": true})))
+pub async fn handle_v1_healthz(State(gs): State<GatewayState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({"ok": true, "auth_enabled": gs.auth.is_enabled()})),
+    )
 }
 
 /// `GET /v1/readyz` — gateway readiness probe.
@@ -347,6 +354,7 @@ pub async fn handle_v1_readyz(State(gs): State<GatewayState>) -> impl IntoRespon
         StatusCode::OK,
         Json(json!({
             "ok": true,
+            "auth_enabled": gs.auth.is_enabled(),
             "checks": [{"name": "gateway", "ok": true}],
             "live_instance_count": instances.len(),
             "ready_instance_count": ready_instance_count,

@@ -737,11 +737,15 @@ async fn async_main() -> anyhow::Result<()> {
         #[cfg(feature = "gateway-auto")]
         Some(SubCmd::Sidecar(sidecar_args)) => dcc_mcp_sidecar::run(sidecar_args).await,
         #[cfg(feature = "gateway-daemon")]
-        Some(SubCmd::Gateway(gateway_args)) => {
-            if gateway_args.restart {
-                return gateway_daemon::restart_gateway(&gateway_args).await;
+        Some(SubCmd::Gateway(gateway_cli)) => {
+            if gateway_cli.gateway.restart {
+                return gateway_daemon::restart_gateway_with_auth(
+                    &gateway_cli.gateway,
+                    gateway_cli.auth_token_file.as_deref(),
+                )
+                .await;
             }
-            gateway_daemon::run(gateway_args).await
+            gateway_daemon::run_with_auth(gateway_cli.gateway, gateway_cli.auth_token_file).await
         }
         Some(SubCmd::Update { action }) => {
             update::run_update_cmd(_update_gateway_port, action).await

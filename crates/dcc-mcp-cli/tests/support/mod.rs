@@ -14,8 +14,180 @@ use tokio::sync::oneshot;
 
 pub(crate) struct GatewayFixture {
     pub(crate) base_url: String,
+    pub(crate) authorization_headers: Arc<AtomicUsize>,
     pub(crate) shutdown: Option<oneshot::Sender<()>>,
     pub(crate) thread: Option<std::thread::JoinHandle<()>>,
+}
+
+pub(crate) struct AuthGatewayFixture {
+    pub(crate) base_url: String,
+    pub(crate) dispatches: Arc<AtomicUsize>,
+    pub(crate) mcp_calls: Arc<AtomicUsize>,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for AuthGatewayFixture {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AuthFixtureState {
+    dispatches: Arc<AtomicUsize>,
+    mcp_calls: Arc<AtomicUsize>,
+}
+
+fn authorize_fixture(headers: &HeaderMap) -> Result<(), StatusCode> {
+    match headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("Bearer studio-secret") => Ok(()),
+        Some("Bearer denied") => Err(StatusCode::FORBIDDEN),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+pub(crate) fn spawn_auth_gateway_fixture() -> AuthGatewayFixture {
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let mcp_calls = Arc::new(AtomicUsize::new(0));
+    let state = AuthFixtureState {
+        dispatches: Arc::clone(&dispatches),
+        mcp_calls: Arc::clone(&mcp_calls),
+    };
+    let app = Router::new()
+        .route(
+            "/health",
+            get(|| async { Json(json!({"ok": true, "auth_enabled": true})) }),
+        )
+        .route(
+            "/v1/healthz",
+            get(|| async { Json(json!({"ok": true, "auth_enabled": true})) }),
+        )
+        .route(
+            "/v1/call",
+            post(
+                |State(state): State<AuthFixtureState>,
+                 headers: HeaderMap,
+                 Json(body): Json<Value>| async move {
+                    if let Err(status) = authorize_fixture(&headers) {
+                        return (status, Json(json!({"error": "authorization rejected"})))
+                            .into_response();
+                    }
+                    state.dispatches.fetch_add(1, Ordering::SeqCst);
+                    if body["tool_slug"] == "compat_tool" {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"message": "invalid tool slug 'compat_tool'"})),
+                        )
+                            .into_response();
+                    }
+                    Json(json!({"success": true, "route": "rest"})).into_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/call_batch",
+            post(
+                |State(state): State<AuthFixtureState>, headers: HeaderMap| async move {
+                    if let Err(status) = authorize_fixture(&headers) {
+                        return (status, Json(json!({"error": "authorization rejected"})))
+                            .into_response();
+                    }
+                    state.dispatches.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"success": true, "route": "batch", "results": []})).into_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/recordings/start",
+            post(
+                |State(state): State<AuthFixtureState>, headers: HeaderMap| async move {
+                    if let Err(status) = authorize_fixture(&headers) {
+                        return (status, Json(json!({"error": "authorization rejected"})))
+                            .into_response();
+                    }
+                    state.dispatches.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"success": true, "recording_id": "rec-auth"})).into_response()
+                },
+            ),
+        )
+        .route(
+            "/v1/dcc/{dcc_type}/instances/{instance_id}/call",
+            post(
+                |State(state): State<AuthFixtureState>,
+                 headers: HeaderMap,
+                 Path((dcc_type, instance_id)): Path<(String, String)>| async move {
+                    if let Err(status) = authorize_fixture(&headers) {
+                        return (status, Json(json!({"error": "authorization rejected"})))
+                            .into_response();
+                    }
+                    state.dispatches.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "success": true,
+                        "route": "direct",
+                        "dcc_type": dcc_type,
+                        "instance_id": instance_id,
+                    }))
+                    .into_response()
+                },
+            ),
+        )
+        .route(
+            "/mcp",
+            post(
+                |State(state): State<AuthFixtureState>,
+                 headers: HeaderMap,
+                 Json(body): Json<Value>| async move {
+                    if let Err(status) = authorize_fixture(&headers) {
+                        return (status, Json(json!({"error": "authorization rejected"})))
+                            .into_response();
+                    }
+                    state.mcp_calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {
+                            "structuredContent": {"success": true, "route": "mcp"}
+                        }
+                    }))
+                    .into_response()
+                },
+            ),
+        )
+        .with_state(state);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+    });
+
+    AuthGatewayFixture {
+        base_url: format!("http://{addr}"),
+        dispatches,
+        mcp_calls,
+        shutdown: Some(shutdown_tx),
+        thread: Some(thread),
+    }
 }
 
 impl Drop for GatewayFixture {
@@ -91,10 +263,22 @@ pub(crate) fn json_or_compact_fixture_response(
 
 pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
     let async_polls = Arc::new(AtomicUsize::new(0));
+    let authorization_headers = Arc::new(AtomicUsize::new(0));
+    let health_authorization_headers = Arc::clone(&authorization_headers);
+    let mcp_authorization_headers = Arc::clone(&authorization_headers);
+    let search_authorization_headers = Arc::clone(&authorization_headers);
     let app = Router::new()
         .route(
             "/health",
-            get(|| async { Json(json!({"ok": true, "service": "dcc-mcp-gateway"})) }),
+            get(move |headers: HeaderMap| {
+                let authorization_headers = Arc::clone(&health_authorization_headers);
+                async move {
+                    if headers.contains_key(header::AUTHORIZATION) {
+                        authorization_headers.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(json!({"ok": true, "service": "dcc-mcp-gateway"}))
+                }
+            }),
         )
         .route(
             "/update-manifest.json",
@@ -111,7 +295,12 @@ pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
         )
         .route(
             "/mcp",
-            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let authorization_headers = Arc::clone(&mcp_authorization_headers);
+                async move {
+                if headers.contains_key(header::AUTHORIZATION) {
+                    authorization_headers.fetch_add(1, Ordering::SeqCst);
+                }
                 let accept = headers
                     .get(header::ACCEPT)
                     .and_then(|value| value.to_str().ok())
@@ -205,6 +394,7 @@ pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
                             }
                         })),
                     ),
+                }
                 }
             }),
         )
@@ -311,7 +501,12 @@ pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
         )
         .route(
             "/v1/search",
-            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let authorization_headers = Arc::clone(&search_authorization_headers);
+                async move {
+                if headers.contains_key(header::AUTHORIZATION) {
+                    authorization_headers.fetch_add(1, Ordering::SeqCst);
+                }
                 json_or_compact_fixture_response(
                     &headers,
                     json!({
@@ -329,6 +524,7 @@ pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
                     }),
                     "hits[slug:\"maya.abc12345.create_sphere\"]",
                 )
+                }
             }),
         )
         .route(
@@ -573,7 +769,7 @@ pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
             }),
         );
 
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
     let addr = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -592,7 +788,8 @@ pub(crate) fn spawn_gateway_fixture() -> GatewayFixture {
     });
 
     GatewayFixture {
-        base_url: format!("http://{addr}"),
+        base_url: format!("http://127.0.0.1:{}", addr.port()),
+        authorization_headers,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
     }

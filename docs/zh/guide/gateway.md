@@ -78,6 +78,7 @@ detached child PID；如果 child 无法启动或 pidfile 无法写入，会在�
 | `--pidfile` | `DCC_MCP_PIDFILE` | 无 |
 | `--gateway-persist` | `DCC_MCP_GATEWAY_PERSIST` | `false` |
 | `--gateway-idle-timeout-secs` | `DCC_MCP_GATEWAY_IDLE_TIMEOUT_SECS` | `30` |
+| `--auth-token-file PATH` | `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE` | auth 关闭 |
 
 附加环境变量：
 
@@ -499,6 +500,30 @@ cfg = McpHttpConfig(
 
 ## Security（issue #1365）
 
+daemon 的最小 operational 配置只接受一个可选 token 文件：
+
+```bash
+dcc-mcp-server gateway --host 0.0.0.0 --port 9765 \
+    --auth-token-file /run/secrets/dcc-mcp-gateway.token
+```
+
+也可用 `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE`。daemon 会在 daemonize 或替换现有
+daemon 之前读取文件、trim 外层空白，并构造一个
+`GatewayAuthToken::any_dcc`。文件 missing、unreadable、empty 或无法作为 HTTP
+Authorization header 时，启动会显式失败。argv、manifest、profile、output、
+log 和 `Debug` 中都不得出现 token value；spawn argv 只允许保留文件路径。
+
+guardian/ensure 使用的 `GET /health`、`GET /v1/healthz`、`GET /v1/readyz`
+保持 public，并返回 `auth_enabled: true|false` 以确认配置；这个 boolean 不代表
+调用者已通过认证或授权。
+
+managed start/ensure 不会把任意健康 2xx resident 当作匹配启动。它会比较 requested
+auth mode 与 `auth_enabled`；只有 enabled/enabled、disabled/disabled，以及
+legacy-unknown/no-auth 兼容。managed restart 会在停止旧进程前验证 replacement
+token 文件，因此 missing、unreadable、empty 或 invalid replacement 不会停止
+auth-enabled 或 auth-disabled resident。status 与 managed ensure 只输出三态
+`auth_state`，绝不输出 token value 或 token-file path。
+
 默认的 `GatewayAuth::disabled()` 保留历史 local-trust 行为。独立 gateway
 填充 `GatewayConfig::auth` 后，以下路径必须提供
 `Authorization: Bearer <token>`：
@@ -524,6 +549,12 @@ token，不会根据不完整的 capability annotation 推断 anonymous read-onl
 给 DCC backend；禁用 auth 时保留历史 header forwarding。Native gateway
 admin/lifecycle/skill/update mutation 和直接 per-DCC `McpHttpServer` 不属于
 这个 bounded gateway dispatch contract。
+
+本 slice 尚未实现 remote HTTP adapter registration credential producer。
+因此，auth-enabled daemon 上的 `POST /v1/instances/register` 还需要后续设计的
+adapter-owned credential producer；在这个 exact gap 关闭前，不应把 authenticated
+HTTP registration 标记为 operational/qualified。gateway call credential 也不能
+转发或复用为 backend credential。
 
 ## 非目标
 

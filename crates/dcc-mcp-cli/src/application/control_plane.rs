@@ -40,6 +40,7 @@ pub(crate) struct JobWaitProgress {
 pub struct DccControlPlane {
     target: GatewayTarget,
     endpoint: Endpoint,
+    gateway: HttpGateway,
     registry_dir: PathBuf,
     require_gateway: bool,
     auto_gateway_enabled: bool,
@@ -53,13 +54,36 @@ impl DccControlPlane {
         registry_dir: PathBuf,
         require_gateway: bool,
     ) -> Self {
-        Self {
+        Self::build(target, endpoint, registry_dir, require_gateway, None)
+            .expect("building an unauthenticated gateway client")
+    }
+
+    pub fn with_auth_token_file(
+        target: GatewayTarget,
+        endpoint: Endpoint,
+        registry_dir: PathBuf,
+        require_gateway: bool,
+        token_file: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        Self::build(target, endpoint, registry_dir, require_gateway, token_file)
+    }
+
+    fn build(
+        target: GatewayTarget,
+        endpoint: Endpoint,
+        registry_dir: PathBuf,
+        require_gateway: bool,
+        token_file: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let gateway = HttpGateway::build(Duration::from_secs(30), token_file)?;
+        Ok(Self {
             target,
             endpoint,
+            gateway,
             registry_dir,
             require_gateway,
             auto_gateway_enabled: true,
-        }
+        })
     }
 
     #[must_use]
@@ -84,7 +108,8 @@ impl DccControlPlane {
     }
 
     pub async fn stats(&self, request: StatsRequest) -> anyhow::Result<Value> {
-        let value = DccMcpClient::new(self.endpoint.clone())
+        let value = self
+            .gateway_client()
             .stats(request)
             .await
             .map_err(anyhow::Error::from)?;
@@ -157,7 +182,7 @@ impl DccControlPlane {
         } else {
             let client = DccMcpClient::with_gateway(
                 self.endpoint.clone(),
-                HttpGateway::with_timeout(timeout),
+                self.gateway.with_request_timeout(timeout)?,
             );
             match (dcc_type, instance_id) {
                 (Some(dcc_type), Some(instance_id)) => client
@@ -361,11 +386,13 @@ impl DccControlPlane {
     pub async fn call_batch(&self, body: Value, timeout: Duration) -> anyhow::Result<Value> {
         // Local mode owns and auto-starts the machine gateway, so batches use
         // its REST endpoint even though single calls can take the direct MCP path.
-        let value =
-            DccMcpClient::with_gateway(self.endpoint.clone(), HttpGateway::with_timeout(timeout))
-                .call_batch(body)
-                .await
-                .map_err(anyhow::Error::from)?;
+        let value = DccMcpClient::with_gateway(
+            self.endpoint.clone(),
+            self.gateway.with_request_timeout(timeout)?,
+        )
+        .call_batch(body)
+        .await
+        .map_err(anyhow::Error::from)?;
         Ok(attach_call_route(value, false))
     }
 
@@ -448,7 +475,32 @@ impl DccControlPlane {
     }
 
     fn gateway_client(&self) -> DccMcpClient {
-        DccMcpClient::new(self.endpoint.clone())
+        DccMcpClient::with_gateway(self.endpoint.clone(), self.gateway.clone())
+    }
+
+    pub fn client_with_timeout(&self, timeout: Duration) -> anyhow::Result<DccMcpClient> {
+        Ok(DccMcpClient::with_gateway(
+            self.endpoint.clone(),
+            self.gateway.with_request_timeout(timeout)?,
+        ))
+    }
+
+    pub fn http_gateway_with_timeout(&self, timeout: Duration) -> anyhow::Result<HttpGateway> {
+        Ok(self.gateway.with_request_timeout(timeout)?)
+    }
+
+    pub async fn post_gateway_json_with_headers(
+        &self,
+        path: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
+        Ok(self
+            .gateway
+            .with_request_timeout(timeout)?
+            .post_json_with_headers(&self.endpoint.path(path), body, headers)
+            .await?)
     }
 }
 

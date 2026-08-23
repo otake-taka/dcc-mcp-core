@@ -86,15 +86,35 @@ for streams, and `--output human` for interactive display.
 Register and select remote profiles with:
 
 ```bash
-dcc-mcp-cli gateway register https://workstation.example:19293 --name pcA
+dcc-mcp-cli gateway register https://workstation.example:19293 --name pcA \
+    --token-file ~/.config/dcc-mcp/pcA.token
 dcc-mcp-cli gateway list
 dcc-mcp-cli gateway set pcA
 dcc-mcp-cli gateway set local
 ```
 
+`--token-file` is profile configuration, not a per-call credential flag. The
+profile stores only the local file path (never the token value), and old
+profiles without this field remain valid. The selected profile builds one HTTP
+client with a sensitive `Authorization` header; health, REST, MCP compatibility,
+batch, and direct gateway calls share that client. HTTP 401/403 responses are
+terminal and never trigger a local/direct or REST-to-MCP fallback. Profile list,
+register, and selection summaries omit the token-file path.
+
+Credential ownership follows the selected target: a named remote profile uses
+the endpoint and token-file path from one profile-file snapshot; the built-in
+local target and an explicit loopback `--base-url` use
+`DCC_MCP_GATEWAY_AUTH_TOKEN_FILE` for both the HTTP client and lifecycle ensure.
+The local environment credential is ignored for a named remote target. An
+explicit `--base-url` outside the managed local endpoint allowlist is
+unauthenticated; configure a named profile for authenticated remote access.
+Commands that do not use a gateway load neither source.
+
 `--gateway <name>` overrides the current profile for one command. `--base-url`
 and `DCC_MCP_BASE_URL` remain supported as direct endpoint overrides for legacy
-scripts and smoke checks.
+scripts and smoke checks. `smoke --url <mcp-url>` is also an explicit direct
+endpoint and never reuses a selected profile's bearer across origins; omit
+`--url` to smoke-test the selected authenticated profile.
 
 Add `--require-gateway` (or set `DCC_MCP_CLI_REQUIRE_GATEWAY=true`) when local
 calls must be retained by Gateway audit/stats. This route is fail-closed and
@@ -240,13 +260,13 @@ their worker-owned status tool.
 | `update apply` | `GET /v1/update/check` + download URL | Download and stage the CLI binary for the next CLI launch. It does not update running server instances; run `dcc-mcp-server update apply` in the exact server environment. |
 | `components status dcc-cua` | CLI sibling + `dcc-cua manifest` | Read-only check of the independently released CUA runtime installed beside this CLI. |
 | `components ensure dcc-cua [--version <version>] --yes` | official per-target install manifest + archive | Download only from `dcc-mcp/dcc-cua`, require the manifest SHA-256, safely extract and validate the candidate runtime contract, then install it beside this CLI. Explicit `--yes` is mandatory. |
-| `gateway register <url> --name <profile>` | local profile config | Persist a named remote gateway profile. |
+| `gateway register <url> --name <profile> [--token-file <path>]` | local profile config | Persist a named remote gateway profile and optional local token-file path. |
 | `gateway list` | local profile config | Show configured remote profiles and the active local/remote selection. |
 | `gateway set <profile\|local>` | local profile config | Select the active gateway profile. |
-| `gateway daemon start [--port <port>]` | local process | Start the local machine-wide gateway daemon. Defaults to `--gateway-idle-timeout-secs 0`, so an explicitly managed daemon stays alive with no backends. |
-| `gateway daemon restart [--port <port>]` | local process | Stop the pidfile-tracked daemon, then start it again. The restart's start phase uses the same persistent default as `daemon start`. |
+| `gateway daemon start [--port <port>] [--auth-token-file <path>]` | local process | Start the local machine-wide gateway daemon. Defaults to `--gateway-idle-timeout-secs 0`; only the token-file path is forwarded to the server argv. |
+| `gateway daemon restart [--port <port>] [--auth-token-file <path>]` | local process | Restart the pidfile-tracked daemon. The replacement token file is validated before stop. If public `/health` reports `auth_enabled: true`, the replacement must provide a valid `--auth-token-file` or `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE`; otherwise restart fails before stop. Legacy health without that field remains compatible only for a no-auth replacement. |
 | `gateway daemon stop [--port <port>]` | local process | Stop a running gateway daemon by PID file and verify exit. |
-| `gateway daemon status [--port <port>]` | local process | Report gateway daemon health, PID, process liveness, registry dir, PID file, health URL, and CLI version. |
+| `gateway daemon status [--port <port>]` | local process | Report gateway daemon health, PID, process liveness, registry dir, PID file, health URL, CLI version, and secret-free `auth_state` (`enabled`, `disabled`, or `unknown`). |
 | `gateway ensure/start/stop/status` | local process | Backward-compatible aliases for older scripts; prefer `gateway daemon ...` in user-facing docs. |
 | `lint [PATH ...]` | local filesystem validator | Recursively validate SKILL.md packages two levels below each path by default. |
 
@@ -298,6 +318,18 @@ paths. Their default `--gateway-idle-timeout-secs 0` disables idle shutdown;
 pass a non-zero timeout only when a script intentionally wants a short-lived
 daemon. Automatic loopback gateway ensure applies to the agent-control path and
 endpoint commands; it can be disabled per invocation with `--no-auto-gateway`.
+All preferred lifecycle start paths (`gateway ensure`, `gateway start`, and
+`gateway daemon start/restart`) accept `--auth-token-file` and
+`DCC_MCP_GATEWAY_AUTH_TOKEN_FILE`, and propagate only that path to the spawned
+`dcc-mcp-server gateway` argv.
+When start/ensure finds a healthy resident, it compares the requested auth mode
+with public `auth_enabled` before returning `already_running`. Auth requested
+against disabled or legacy-unknown, and no auth requested against enabled, fail
+with a restart/configuration message. Only legacy unknown plus no-auth preserves
+the historical success contract. Managed start/ensure output includes the same
+secret-free `auth_state`. A configured remote profile is loaded only by commands
+that actually use that profile; explicit `smoke --url`, `dcc-types`, `doctor`,
+`lint`, and `components` do not read its token file.
 
 `install` defaults to a planning contract: it resolves catalog entries and
 spells out the adapter package / host-plugin / verification steps without

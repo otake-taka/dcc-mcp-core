@@ -71,14 +71,34 @@ DCC-MCP 的客户端控制面。它是主要用户/agent 入口；它不托管 s
 注册和选择远程 profile：
 
 ```bash
-dcc-mcp-cli gateway register https://workstation.example:19293 --name pcA
+dcc-mcp-cli gateway register https://workstation.example:19293 --name pcA \
+    --token-file ~/.config/dcc-mcp/pcA.token
 dcc-mcp-cli gateway list
 dcc-mcp-cli gateway set pcA
 dcc-mcp-cli gateway set local
 ```
 
+`--token-file` 是 profile 配置，不是每条 call 的 credential flag。profile
+只保存本地 token 文件路径（绝不保存 token value）；没有该字段的旧 profile
+仍可读取。选中的 profile 会构造一个共享 HTTP client，并把
+`Authorization` 标记为 sensitive；health、REST、MCP compatibility、batch
+和 direct gateway call 都复用该 client。HTTP 401/403 是 terminal failure，
+不会触发 local/direct 或 REST→MCP fallback。profile 的 list/register/set
+摘要不会输出 token 文件路径。
+
+credential ownership 由选中的 target 决定：named remote profile 的 endpoint
+与 token-file path 来自同一次 profile-file snapshot；内置 local target 和显式
+loopback `--base-url` 则把 `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE` 同时用于 HTTP
+client 与 lifecycle ensure。选择 named remote 时忽略 local environment
+credential。显式 `--base-url` 若不在 managed local endpoint allowlist 内则
+不携带认证；authenticated remote access 必须配置 named profile。不使用
+gateway 的命令不会加载任一 credential source。
+
 `--gateway <name>` 可为单次命令覆盖当前 profile。`--base-url` 与
 `DCC_MCP_BASE_URL` 继续作为旧脚本和 smoke check 的直接 endpoint override。
+`smoke --url <mcp-url>` 同样是显式 direct endpoint，绝不会把选中 profile 的
+bearer 复用到另一个 origin；要检查选中的 authenticated profile，请省略
+`--url`。
 
 如果本地调用必须进入 Gateway audit/stats，请加 `--require-gateway`（或设置
 `DCC_MCP_CLI_REQUIRE_GATEWAY=true`）。该路径 fail-closed，不会静默回退到
@@ -197,10 +217,10 @@ dcc-mcp-cli lint path/to/skills
 | `marketplace publish <path> --catalog <file> --install-url <url>` | local marketplace catalog file | 根据 `SKILL.md` 元数据和 CLI 覆盖字段创建或更新 `marketplace.json` 条目。 |
 | `update check [--binary <name>] [--current-version <version>]` | `GET /v1/update/check` | 检查 gateway update manifest。默认检查 CLI 自身；检查 Admin 面板里的实例版本时，传 `--binary dcc-mcp-server` 和对应 server 版本。 |
 | `update apply` | `GET /v1/update/check` + download URL | 下载并暂存 CLI binary，下一次 CLI 启动时应用。它不会更新正在运行的 server 实例；请在目标 server 环境里运行 `dcc-mcp-server update apply`。 |
-| `gateway register <url> --name <profile>` | local profile config | 保存命名远程 gateway profile。 |
+| `gateway register <url> --name <profile> [--token-file <path>]` | local profile config | 保存命名远程 gateway profile 和可选的本地 token 文件路径。 |
 | `gateway list` | local profile config | 显示已配置的远程 profile 和当前 local/remote 选择。 |
 | `gateway set <profile\|local>` | local profile config | 选择当前 gateway profile。 |
-| `gateway daemon start/restart/stop/status` | local process | 显式管理本机 machine-wide gateway daemon 生命周期；`start` 和 `restart` 的启动阶段默认传 `--gateway-idle-timeout-secs 0`，无 backend 时也保持存活；`status` 会输出 registry dir、PID file、health URL 和 CLI version 等诊断字段。 |
+| `gateway daemon start/restart/stop/status` | local process | 显式管理本机 daemon；`start/restart` 接受 `--auth-token-file <path>` / `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE`，只向 server argv 传文件路径。restart 会在 stop 前验证 replacement token 文件；若 public `/health` 返回 `auth_enabled: true` 而 replacement 没有有效路径，则旧进程保持不变。缺少该字段的 legacy health 只对 no-auth replacement 保持兼容。status 输出 secret-free `auth_state`。 |
 | `gateway ensure/start/stop/status` | local process | 旧脚本兼容 alias；面向用户文档优先使用 `gateway daemon ...`。 |
 | `lint [PATH ...]` | local filesystem validator | 默认递归校验每个路径下两层内的 SKILL.md 包。 |
 
@@ -229,6 +249,16 @@ dcc-mcp-cli lint path/to/skills
 `--gateway-idle-timeout-secs 0` 会关闭 idle shutdown；只有脚本明确想要短生命周期
 daemon 时才传非零 timeout。本机 loopback auto-ensure 覆盖 agent-control path
 和 endpoint 命令；单次不想启动可传 `--no-auto-gateway`。
+`gateway ensure`、`gateway start`、`gateway daemon start/restart` 都显式拥有
+`--auth-token-file` / `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE`，并只把 token 文件路径
+传给 spawned `dcc-mcp-server gateway` argv。
+start/ensure 遇到健康 resident 时，会在返回 `already_running` 前比较 requested auth
+mode 与 public `auth_enabled`。请求 auth 对应 disabled/legacy-unknown resident，或
+no-auth 请求对应 enabled resident，都会用可操作的 restart/config 信息显式失败；
+只有 legacy unknown + no-auth 保留旧成功行为。managed start/ensure 输出同一
+secret-free `auth_state`。只有实际使用 selected remote profile 的命令才读取其
+token 文件；explicit `smoke --url`、`dcc-types`、`doctor`、`lint`、`components`
+均与该 credential state 独立。
 
 `install` 默认仍是规划契约：它解析 catalog entry，并列出 adapter package、
 host plugin 和验证步骤，不会静默修改 DCC 插件目录。JSON plan 还会包含

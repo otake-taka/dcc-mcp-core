@@ -27,7 +27,7 @@ pub(crate) enum SubCmd {
     Sidecar(dcc_mcp_sidecar::SidecarArgs),
     /// Machine-wide gateway daemon. Per-DCC sidecars auto-launch this when needed.
     #[cfg(feature = "gateway-daemon")]
-    Gateway(dcc_mcp_sidecar::gateway_daemon::GatewayArgs),
+    Gateway(dcc_mcp_sidecar::gateway_daemon::GatewayDaemonCliArgs),
     /// Check for and apply gateway-controlled binary updates.
     Update {
         #[command(subcommand)]
@@ -412,5 +412,26 @@ mod tests {
             Args::try_parse_from(["dcc-mcp-server", "gateway", "--app", "maya"]).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    #[cfg(feature = "gateway-daemon")]
+    fn gateway_subcommand_owns_auth_token_file_path_without_changing_gateway_args() {
+        let parsed = Args::try_parse_from([
+            "dcc-mcp-server",
+            "gateway",
+            "--auth-token-file",
+            "/run/secrets/dcc-mcp-gateway.token",
+        ])
+        .unwrap();
+
+        let Some(SubCmd::Gateway(gateway)) = parsed.command else {
+            panic!("expected gateway subcommand");
+        };
+        assert_eq!(
+            gateway.auth_token_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/dcc-mcp-gateway.token"))
+        );
+        assert_eq!(gateway.gateway.port, 9765);
     }
 }

@@ -65,13 +65,13 @@ vx python scripts/dcc_gateway.py --ensure-cli list
 | `dcc-mcp-cli search --require-gateway --query "create sphere" --dcc-type maya --limit 20` | Fail closed unless the local gateway serves the control request; use this route for measured workflows |
 | `dcc-mcp-cli list --gateway pcA` | List DCC instances through a named remote gateway profile |
 | `dcc-mcp-cli health` (or `python scripts/dcc_gateway.py health`) | Check gateway liveness; CLI auto-starts loopback gateway targets |
-| `dcc-mcp-cli gateway register https://host:19293 --name pcA` | Persist a named remote gateway profile |
+| `dcc-mcp-cli gateway register https://host:19293 --name pcA --token-file ~/.config/dcc-mcp/pcA.token` | Persist a named remote gateway profile and only the local token-file path |
 | `dcc-mcp-cli gateway list` | Inspect configured remote profiles and the active selection |
 | `dcc-mcp-cli gateway set pcA` / `dcc-mcp-cli gateway set local` | Switch active gateway profile |
 | `dcc-mcp-cli gateway daemon start` | Start the explicit local machine-wide daemon; default idle timeout is `0`, so it stays alive with no DCC backend |
-| `dcc-mcp-cli gateway daemon restart` | Stop the pidfile-tracked daemon, then start it again with the same persistent default |
+| `dcc-mcp-cli gateway daemon restart [--auth-token-file PATH]` | Validate replacement auth before stop, require resident/request auth modes to match, then restart the pidfile-tracked daemon |
 | `dcc-mcp-cli gateway daemon stop` | Stop the pidfile-tracked local daemon |
-| `dcc-mcp-cli gateway daemon status` | Explicit local daemon lifecycle check with registry dir, PID file, health URL, and CLI version |
+| `dcc-mcp-cli gateway daemon status` | Explicit local daemon lifecycle check with registry dir, PID file, health URL, CLI version, and secret-free `auth_state` |
 | `dcc-mcp-cli list --pretty` (or `python scripts/dcc_gateway.py --pretty list`) | Human-readable JSON |
 
 ## Capability workflow

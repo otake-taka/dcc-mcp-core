@@ -7,8 +7,6 @@ use serde_json::{Value, json};
 
 use crate::application::call_attribution::attach_agent_session_id;
 use crate::application::control_plane::DccControlPlane;
-use crate::domain::rest::Endpoint;
-use crate::infra::http::HttpGateway;
 
 use super::image_artifacts::{default_image_artifact_root, materialize_call_images};
 
@@ -67,13 +65,11 @@ pub(super) struct RecordReplayResult {
 pub(super) async fn run_record_replay(
     action: RecordReplayAction,
     agent_session_id: Option<&str>,
-    endpoint: &Endpoint,
     control: &DccControlPlane,
 ) -> anyhow::Result<RecordReplayResult> {
     let session_id = agent_session_id
         .filter(|value| !value.trim().is_empty())
         .context("record-replay requires --agent-session-id")?;
-    let gateway = HttpGateway::with_timeout(Duration::from_secs(30));
     let headers = [("x-dcc-mcp-agent-session-id", session_id)];
     let mut failed = false;
     let value = match action {
@@ -81,30 +77,33 @@ pub(super) async fn run_record_replay(
             dcc_type,
             instance_id,
         } => {
-            gateway
-                .post_json_with_headers(
-                    &endpoint.path("/v1/recordings/start"),
+            control
+                .post_gateway_json_with_headers(
+                    "/v1/recordings/start",
                     &json!({"dcc_type": dcc_type, "instance_id": instance_id}),
                     &headers,
+                    Duration::from_secs(30),
                 )
                 .await?
         }
         RecordReplayAction::Stop { recording_id } => {
-            gateway
-                .post_json_with_headers(
-                    &endpoint.path("/v1/recordings/stop"),
+            control
+                .post_gateway_json_with_headers(
+                    "/v1/recordings/stop",
                     &json!({"recording_id": recording_id}),
                     &headers,
+                    Duration::from_secs(30),
                 )
                 .await?
         }
         RecordReplayAction::Review { recording_id } => {
             validate_recording_id(&recording_id)?;
-            gateway
-                .post_json_with_headers(
-                    &endpoint.path("/v1/recordings/review"),
+            control
+                .post_gateway_json_with_headers(
+                    "/v1/recordings/review",
                     &json!({"recording_id": recording_id}),
                     &headers,
+                    Duration::from_secs(30),
                 )
                 .await?
         }
@@ -120,9 +119,9 @@ pub(super) async fn run_record_replay(
                 anyhow::bail!("record-replay compile requires --reviewed");
             }
             let inputs = super::parse_json_object(&inputs_json, "--inputs-json")?;
-            let response = gateway
-                .post_json_with_headers(
-                    &endpoint.path("/v1/recordings/compile"),
+            let response = control
+                .post_gateway_json_with_headers(
+                    "/v1/recordings/compile",
                     &json!({
                         "recording_id": recording_id,
                         "name": name,
@@ -131,6 +130,7 @@ pub(super) async fn run_record_replay(
                         "reviewed": true,
                     }),
                     &headers,
+                    Duration::from_secs(30),
                 )
                 .await?;
             write_compiled_skill(&output_dir, &name, &response)?;
@@ -158,11 +158,12 @@ pub(super) async fn run_record_replay(
                     .with_context(|| format!("read replay guard file {}", guard_file.display()))?,
             )
             .with_context(|| format!("parse replay guard file {}", guard_file.display()))?;
-            gateway
-                .post_json_with_headers(
-                    &endpoint.path("/v1/recordings/replay/validate"),
+            control
+                .post_gateway_json_with_headers(
+                    "/v1/recordings/replay/validate",
                     &json!({"guards": guards}),
                     &headers,
+                    Duration::from_secs(30),
                 )
                 .await?;
             let spec = std::fs::read_to_string(&workflow_file)

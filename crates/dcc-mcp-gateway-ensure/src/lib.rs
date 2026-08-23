@@ -133,6 +133,44 @@ pub async fn gateway_health_ok_with_timeout(host: &str, port: u16, timeout: Dura
         .is_ok_and(|resp| resp.status().is_success())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayAuthState {
+    Enabled,
+    Disabled,
+    Unknown,
+}
+
+/// Read the public `/health` authentication configuration marker.
+/// Legacy or unavailable documents intentionally remain `Unknown`.
+pub async fn gateway_auth_state(host: &str, port: u16) -> GatewayAuthState {
+    let url = gateway_health_url(host, port);
+    let Ok(client) = reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() else {
+        return GatewayAuthState::Unknown;
+    };
+    let Ok(response) = client.get(url).send().await else {
+        return GatewayAuthState::Unknown;
+    };
+    if !response.status().is_success() {
+        return GatewayAuthState::Unknown;
+    }
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return GatewayAuthState::Unknown;
+    };
+    gateway_auth_state_from_document(&body)
+}
+
+fn gateway_auth_state_from_document(body: &serde_json::Value) -> GatewayAuthState {
+    match body
+        .get("auth_enabled")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(true) => GatewayAuthState::Enabled,
+        Some(false) => GatewayAuthState::Disabled,
+        None => GatewayAuthState::Unknown,
+    }
+}
+
 /// Build the gateway `/health` URL used by diagnostics and probes.
 pub fn gateway_health_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}/health")
@@ -405,6 +443,27 @@ pub fn gateway_command_args(
     remote_port: u16,
     gateway_idle_timeout_secs: u64,
 ) -> Vec<OsString> {
+    gateway_command_args_with_auth(
+        host,
+        port,
+        name,
+        remote_host,
+        remote_port,
+        gateway_idle_timeout_secs,
+        None,
+    )
+}
+
+/// Build gateway arguments with an optional auth token-file path.
+pub fn gateway_command_args_with_auth(
+    host: &str,
+    port: u16,
+    name: Option<&str>,
+    remote_host: &str,
+    remote_port: u16,
+    gateway_idle_timeout_secs: u64,
+    auth_token_file: Option<&Path>,
+) -> Vec<OsString> {
     let mut cargs = vec![
         OsString::from("gateway"),
         OsString::from("--host"),
@@ -423,6 +482,10 @@ pub fn gateway_command_args(
     {
         cargs.push(OsString::from("--name"));
         cargs.push(OsString::from(name));
+    }
+    if let Some(path) = auth_token_file {
+        cargs.push(OsString::from("--auth-token-file"));
+        cargs.push(path.as_os_str().to_os_string());
     }
     cargs
 }
@@ -784,6 +847,26 @@ mod tests {
     #[tokio::test]
     async fn test_gateway_health_ok_unreachable() {
         assert!(!gateway_health_ok("127.0.0.1", 19999).await);
+    }
+
+    #[test]
+    fn gateway_auth_state_preserves_legacy_unknown_and_disabled_documents() {
+        assert_eq!(
+            gateway_auth_state_from_document(&serde_json::json!({"ok": true})),
+            GatewayAuthState::Unknown
+        );
+        assert_eq!(
+            gateway_auth_state_from_document(
+                &serde_json::json!({"ok": true, "auth_enabled": false})
+            ),
+            GatewayAuthState::Disabled
+        );
+        assert_eq!(
+            gateway_auth_state_from_document(
+                &serde_json::json!({"ok": true, "auth_enabled": true})
+            ),
+            GatewayAuthState::Enabled
+        );
     }
 
     // ── Command args tests ─────────────────────────────────────────────

@@ -964,12 +964,44 @@ fn gateway_endpoint_for_command_ensures_gateway_for_agent_control_commands() {
                     port: 9765,
                     registry_dir: None,
                 })),
-                daemon: default_gateway_daemon_args(),
+                daemon: dcc_mcp_sidecar::gateway_daemon::GatewayDaemonCliArgs {
+                    gateway: default_gateway_daemon_args(),
+                    auth_token_file: None,
+                },
             },
             &local,
         )
         .is_none()
     );
+}
+
+#[test]
+fn local_lifecycle_applies_to_builtin_local_and_legacy_base_url_but_not_named_remote() {
+    assert!(gateway_target_uses_local_lifecycle(
+        &GatewayTarget::Local,
+        &Endpoint::new(DEFAULT_BASE_URL),
+    ));
+    assert!(gateway_target_uses_local_lifecycle(
+        &GatewayTarget::Remote {
+            name: "base-url".to_string(),
+            endpoint: Endpoint::new("http://127.0.0.1:9765"),
+        },
+        &Endpoint::new("http://127.0.0.1:9765"),
+    ));
+    assert!(!gateway_target_uses_local_lifecycle(
+        &GatewayTarget::Remote {
+            name: "base-url".to_string(),
+            endpoint: Endpoint::new("http://127.0.0.2:19293"),
+        },
+        &Endpoint::new("http://127.0.0.2:19293"),
+    ));
+    assert!(!gateway_target_uses_local_lifecycle(
+        &GatewayTarget::Remote {
+            name: "studio".to_string(),
+            endpoint: Endpoint::new("http://127.0.0.1:9765"),
+        },
+        &Endpoint::new("http://127.0.0.1:9765"),
+    ));
 }
 
 #[test]
@@ -1048,6 +1080,76 @@ fn gateway_daemon_restart_defaults_to_persistent_daemon() {
 
     assert_eq!(restart.start.gateway_idle_timeout_secs, 0);
     assert_eq!(restart.stop_timeout_secs, 10);
+}
+
+#[test]
+fn gateway_lifecycle_commands_parse_and_preserve_auth_token_file_path() {
+    let token_file = "/run/secrets/dcc-mcp-gateway.token";
+    let commands = [
+        vec!["gateway", "ensure", "--auth-token-file", token_file],
+        vec!["gateway", "start", "--auth-token-file", token_file],
+        vec![
+            "gateway",
+            "daemon",
+            "start",
+            "--auth-token-file",
+            token_file,
+        ],
+        vec![
+            "gateway",
+            "daemon",
+            "restart",
+            "--auth-token-file",
+            token_file,
+        ],
+    ];
+
+    for command in commands {
+        let args = Args::parse_from(std::iter::once("dcc-mcp-cli").chain(command));
+        let Command::Gateway {
+            action: Some(action),
+            ..
+        } = args.command
+        else {
+            panic!("expected gateway lifecycle command");
+        };
+        let start = match action {
+            GatewayAction::Ensure(start) | GatewayAction::Start(start) => start,
+            GatewayAction::Daemon {
+                action: GatewayDaemonAction::Start(start),
+            } => start,
+            GatewayAction::Daemon {
+                action: GatewayDaemonAction::Restart(restart),
+            } => restart.start,
+            _ => panic!("expected gateway start arguments"),
+        };
+
+        assert_eq!(
+            start.auth_token_file.as_deref(),
+            Some(std::path::Path::new(token_file))
+        );
+        let (request, request_token_file) = gateway_start_request(start);
+        assert_eq!(
+            request_token_file.as_deref(),
+            Some(std::path::Path::new(token_file))
+        );
+        assert_eq!(request.host, "127.0.0.1");
+    }
+}
+
+#[test]
+fn gateway_start_auth_token_file_has_explicit_flag_and_env_ownership() {
+    let command = <GatewayStartArgs as clap::Args>::augment_args(clap::Command::new("gateway"));
+    let argument = command
+        .get_arguments()
+        .find(|argument| argument.get_id() == "auth_token_file")
+        .unwrap();
+
+    assert_eq!(argument.get_long(), Some("auth-token-file"));
+    assert_eq!(
+        argument.get_env(),
+        Some(std::ffi::OsStr::new("DCC_MCP_GATEWAY_AUTH_TOKEN_FILE"))
+    );
 }
 
 fn default_gateway_daemon_args() -> dcc_mcp_sidecar::gateway_daemon::GatewayArgs {

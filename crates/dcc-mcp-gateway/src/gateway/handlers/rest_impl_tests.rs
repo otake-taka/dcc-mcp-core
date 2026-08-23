@@ -549,6 +549,25 @@ async fn readyz_reports_configured_gateway_lifecycle_policy() {
 }
 
 #[tokio::test]
+async fn public_health_documents_report_whether_auth_is_enabled() {
+    let mut gs = test_gateway_state("test-version");
+    gs.auth = Arc::new(crate::gateway::security::GatewayAuth {
+        tokens: vec![crate::gateway::security::GatewayAuthToken::any_dcc(
+            "studio-secret",
+        )],
+    });
+
+    let (_, health) = response_json(handle_health(State(gs.clone())).await.into_response()).await;
+    let (_, healthz) =
+        response_json(handle_v1_healthz(State(gs.clone())).await.into_response()).await;
+    let (_, readyz) = response_json(handle_v1_readyz(State(gs)).await.into_response()).await;
+
+    assert_eq!(health["auth_enabled"], true);
+    assert_eq!(healthz["auth_enabled"], true);
+    assert_eq!(readyz["auth_enabled"], true);
+}
+
+#[tokio::test]
 async fn gateway_docs_serves_scalar_openapi_ui() {
     let (status, body) =
         response_text(handle_v1_docs(State(test_gateway_state("1.2.3"))).await).await;

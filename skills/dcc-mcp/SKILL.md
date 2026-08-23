@@ -241,7 +241,8 @@ that, they remain visible for diagnostics. Use `wait-ready` or `doctor` when a
 listed instance is still booting.
 
 ```bash
-dcc-mcp-cli gateway register https://workstation.example:19293 --name pcA
+dcc-mcp-cli gateway register https://workstation.example:19293 --name pcA \
+    --token-file ~/.config/dcc-mcp/pcA.token
 dcc-mcp-cli gateway list
 dcc-mcp-cli gateway set pcA
 dcc-mcp-cli gateway set local
@@ -250,7 +251,29 @@ dcc-mcp-cli list --gateway pcA
 
 Use `--gateway <name>` to override the current profile for one command.
 `--base-url` / `DCC_MCP_BASE_URL` remain direct endpoint overrides for legacy
-scripts and smoke checks.
+scripts and smoke checks. Authenticated remote profiles store only the local
+token-file path; they never store or print the token value. Do not add a token
+flag to individual control commands. HTTP 401/403 is terminal and must not
+trigger REST-to-MCP or local/direct fallback. Treat `smoke --url <mcp-url>` as
+an explicit unauthenticated endpoint: never reuse the selected profile bearer
+across origins; omit `--url` to inspect the selected authenticated profile.
+Credential ownership is target-bound: named remote endpoint and token-file path
+come from one profile snapshot, while built-in local and explicit loopback
+`--base-url` targets use `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE` for both the shared
+HTTP client and lifecycle ensure. Ignore that local environment credential when
+a named remote is selected. Explicit `--base-url` outside the managed local
+endpoint allowlist is unauthenticated; use a named profile for authenticated
+remote access. Load no credential for gateway-unused commands.
+For preferred local lifecycle commands, pass the daemon credential as
+`gateway ensure/start/daemon start/daemon restart --auth-token-file <path>` or
+through `DCC_MCP_GATEWAY_AUTH_TOKEN_FILE`; only the path reaches the spawned
+server argv. Restart refuses to stop an `auth_enabled: true` daemon when the
+replacement has no token-file path. Legacy health documents without that field
+remain compatible only for a no-auth replacement. Restart validates any
+replacement token file before stop. Start/ensure reject resident/request auth
+mode mismatches instead of returning `already_running`, and report only the
+secret-free `auth_state`. Commands that do not use the selected gateway profile,
+including explicit `smoke --url`, must not load or reuse its credential.
 
 Use `--require-gateway` for any local workflow whose calls must appear in
 Gateway audit/stats. Pair it with `--agent-session-id <task-id>` so every
