@@ -73,10 +73,16 @@ cfg = McpHttpConfig(
 
 ## Auth
 
-Native `McpHttpServer` / gateway auth enforcement is not implemented yet.
-The Python `ApiKeyConfig` and `OAuthConfig` helpers are declarative helpers for
-tool authors and future server wiring; setting `cfg.api_key` or
-`cfg.enable_oauth` is not a supported runtime security boundary today.
+Native per-DCC `McpHttpServer` auth enforcement is not implemented yet. The
+Python `ApiKeyConfig` and `OAuthConfig` helpers are declarative helpers for tool
+authors and future server wiring; setting `cfg.api_key` or `cfg.enable_oauth`
+is not a supported runtime security boundary today.
+
+The standalone Rust gateway is different: a populated `GatewayConfig::auth`
+enforces bearer authentication for HTTP registration, canonical REST/MCP call
+wrappers, and raw MCP proxy routes. This does not protect a client's direct
+connection to the per-DCC `McpHttpServer`; keep that listener on localhost or
+put its own edge authentication in front of it.
 
 For internet-facing deployments, put the MCP endpoint behind a reverse proxy
 or a dedicated OAuth gateway and keep the DCC process itself bound to

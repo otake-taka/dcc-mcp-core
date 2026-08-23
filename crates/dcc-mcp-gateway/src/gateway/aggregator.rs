@@ -27,7 +27,7 @@ mod skill_mgmt;
 #[cfg(test)]
 mod tests;
 
-pub use call::route_tools_call;
+pub(crate) use call::route_tools_call;
 pub use fingerprint::compute_tools_fingerprint;
 pub(crate) use helpers::{
     find_instance_by_prefix, inject_instance_metadata, live_backends, resolve_target,

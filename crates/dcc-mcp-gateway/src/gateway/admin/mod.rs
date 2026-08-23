@@ -188,3 +188,5 @@ mod marketplace_tests;
 mod raw_proxy_lease_tests;
 #[cfg(all(test, feature = "admin"))]
 mod tests;
+#[cfg(all(test, feature = "admin"))]
+mod workers_visibility_tests;

@@ -152,17 +152,34 @@ pub async fn tool_describe(
 }
 
 /// Unified call: single `tool_slug` or ordered `calls` batch (same shape as legacy wrappers).
-pub async fn tool_call(
+pub(crate) async fn tool_call(
     gs: &GatewayState,
     args: &Value,
     meta: Option<&Value>,
+    dispatch_context: &crate::gateway::security::DispatchRequestContext<'_>,
     trace_context: Option<&TraceContext>,
     agent_context: Option<&AgentContext>,
 ) -> (String, bool) {
     if args.get("calls").and_then(Value::as_array).is_some() {
-        tool_call_tools(gs, args, meta, trace_context, agent_context).await
+        tool_call_tools(
+            gs,
+            args,
+            meta,
+            dispatch_context,
+            trace_context,
+            agent_context,
+        )
+        .await
     } else {
-        tool_call_tool(gs, args, meta, trace_context, agent_context).await
+        tool_call_tool(
+            gs,
+            args,
+            meta,
+            dispatch_context,
+            trace_context,
+            agent_context,
+        )
+        .await
     }
 }
 
@@ -454,10 +471,11 @@ pub async fn tool_describe_tool(
 ///
 /// Returns the raw backend `tools/call` envelope on success so
 /// progress events and structured content survive the wrapper.
-pub async fn tool_call_tool(
+pub(crate) async fn tool_call_tool(
     gs: &GatewayState,
     args: &Value,
     meta: Option<&Value>,
+    dispatch_context: &crate::gateway::security::DispatchRequestContext<'_>,
     trace_context: Option<&TraceContext>,
     agent_context: Option<&AgentContext>,
 ) -> (String, bool) {
@@ -492,11 +510,14 @@ pub async fn tool_call_tool(
     // absent or stale, refresh once after that concrete routing error.
     let (result_str, is_error, error_kind) = match crate::gateway::capability_service::call_service(
         gs,
-        slug,
-        arguments.clone(),
-        forwarded_meta.clone(),
-        trace_context,
-        agent_context,
+        crate::gateway::capability_service::CapabilityCallRequest {
+            slug,
+            arguments: arguments.clone(),
+            meta: forwarded_meta.clone(),
+            dispatch_context,
+            trace_context,
+            agent_context,
+        },
     )
     .await
     {
@@ -527,11 +548,14 @@ pub async fn tool_call_tool(
             .await;
             match crate::gateway::capability_service::call_service(
                 gs,
-                slug,
-                arguments,
-                forwarded_meta,
-                trace_context,
-                agent_context,
+                crate::gateway::capability_service::CapabilityCallRequest {
+                    slug,
+                    arguments,
+                    meta: forwarded_meta,
+                    dispatch_context,
+                    trace_context,
+                    agent_context,
+                },
             )
             .await
             {
@@ -658,10 +682,11 @@ pub const MAX_CALL_TOOLS_BATCH: usize = 25;
 ///
 /// `mcp_meta` is optional MCP `_meta` from the outer `tools/call` envelope,
 /// applied to each batch item when that item does not supply its own `meta`.
-pub async fn gateway_call_batch_inner(
+pub(crate) async fn gateway_call_batch_inner(
     gs: &GatewayState,
     args: &Value,
     mcp_meta: Option<&Value>,
+    dispatch_context: &crate::gateway::security::DispatchRequestContext<'_>,
     trace_context: Option<&TraceContext>,
     agent_context: Option<&AgentContext>,
 ) -> Result<Value, String> {
@@ -737,11 +762,14 @@ pub async fn gateway_call_batch_inner(
         let single_outcome = async {
             match crate::gateway::capability_service::call_service(
                 gs,
-                slug,
-                arguments.clone(),
-                forwarded_meta.clone(),
-                child_trace_context,
-                agent_context,
+                crate::gateway::capability_service::CapabilityCallRequest {
+                    slug,
+                    arguments: arguments.clone(),
+                    meta: forwarded_meta.clone(),
+                    dispatch_context,
+                    trace_context: child_trace_context,
+                    agent_context,
+                },
             )
             .await
             {
@@ -754,11 +782,14 @@ pub async fn gateway_call_batch_inner(
                     .await;
                     crate::gateway::capability_service::call_service(
                         gs,
-                        slug,
-                        arguments,
-                        forwarded_meta,
-                        child_trace_context,
-                        agent_context,
+                        crate::gateway::capability_service::CapabilityCallRequest {
+                            slug,
+                            arguments,
+                            meta: forwarded_meta,
+                            dispatch_context,
+                            trace_context: child_trace_context,
+                            agent_context,
+                        },
                     )
                     .await
                 }
@@ -907,14 +938,24 @@ pub async fn gateway_call_batch_inner(
 }
 
 /// `call_tools` — invoke multiple backend capabilities in one MCP round-trip.
-pub async fn tool_call_tools(
+pub(crate) async fn tool_call_tools(
     gs: &GatewayState,
     args: &Value,
     meta: Option<&Value>,
+    dispatch_context: &crate::gateway::security::DispatchRequestContext<'_>,
     trace_context: Option<&TraceContext>,
     agent_context: Option<&AgentContext>,
 ) -> (String, bool) {
-    match gateway_call_batch_inner(gs, args, meta, trace_context, agent_context).await {
+    match gateway_call_batch_inner(
+        gs,
+        args,
+        meta,
+        dispatch_context,
+        trace_context,
+        agent_context,
+    )
+    .await
+    {
         Ok(value) => {
             let is_error = !value
                 .get("success")

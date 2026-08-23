@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use dcc_mcp_gateway_core::policy::{GatewayPolicy, GatewayPolicyDenial, GatewayPolicyOperation};
 use dcc_mcp_jsonrpc::McpTool;
+use dcc_mcp_models::DccName;
 use dcc_mcp_transport::discovery::{
     file_registry::FileRegistry,
     types::{ServiceEntry, instance_status_from_entry},
@@ -558,6 +559,16 @@ fn record_matches_slug(
         .starts_with(&instance_hint.to_ascii_lowercase())
 }
 
+fn instance_hint_matches(instance_hint: &str, instance_id: Uuid) -> bool {
+    if let Ok(full_id) = Uuid::parse_str(instance_hint) {
+        return full_id == instance_id;
+    }
+    instance_id
+        .simple()
+        .to_string()
+        .starts_with(&instance_hint.to_ascii_lowercase())
+}
+
 /// Resolve `slug` and return the exact backend tool definition for that
 /// capability. This is the schema-bearing describe path shared by REST and MCP.
 ///
@@ -660,14 +671,89 @@ fn tool_result_reports_failure_inner(result: &Value, depth: u8) -> bool {
     }
 }
 
-pub async fn call_service(
+pub(crate) struct CapabilityCallRequest<'request, 'auth> {
+    pub(crate) slug: &'request str,
+    pub(crate) arguments: Value,
+    pub(crate) meta: Option<Value>,
+    pub(crate) dispatch_context: &'request super::security::DispatchRequestContext<'auth>,
+    pub(crate) trace_context: Option<&'request TraceContext>,
+    pub(crate) agent_context: Option<&'request AgentContext>,
+}
+
+/// Fail closed on a known dispatch target before request middleware runs.
+///
+/// Credential authentication has already happened at HTTP ingress. This
+/// lightweight lookup performs the second-stage DCC-scope check for every
+/// target already present in the capability index and live registry. Unknown
+/// or currently offline targets are left to the canonical call path, which
+/// may refresh routing state before returning its normal route error.
+/// [`call_service`] repeats the authoritative check immediately before lease
+/// and backend dispatch so a registry change cannot turn this preflight into a
+/// reusable grant.
+pub(crate) async fn authorize_known_dispatch_targets(
     gs: &GatewayState,
-    slug: &str,
-    arguments: Value,
-    meta: Option<Value>,
-    trace_context: Option<&TraceContext>,
-    agent_context: Option<&AgentContext>,
+    dispatch_context: &super::security::DispatchRequestContext<'_>,
+    request: &Value,
+) -> Result<(), super::security::AuthError> {
+    let mut slugs = Vec::new();
+    if let Some(slug) = request.get("tool_slug").and_then(Value::as_str) {
+        slugs.push(slug);
+    }
+    if let Some(calls) = request.get("calls").and_then(Value::as_array) {
+        slugs.extend(
+            calls
+                .iter()
+                .filter_map(|call| call.get("tool_slug").and_then(Value::as_str)),
+        );
+    }
+    if slugs.is_empty() {
+        return Ok(());
+    }
+
+    let live = gs.live_instances_async().await;
+    for slug in slugs {
+        if let Ok(record) = describe_service(&gs.capability_index, slug) {
+            if let Some(entry) = live
+                .iter()
+                .find(|entry| entry.instance_id == record.instance_id)
+            {
+                let resolved_dcc_type = DccName::parse(&entry.dcc_type);
+                gs.auth
+                    .authorize_dispatch(dispatch_context, &resolved_dcc_type)?;
+            }
+            continue;
+        }
+
+        // A freshly registered capability may not be indexed yet. Resolve its
+        // instance hint against actual registry identities before any recovery
+        // refresh; never trust the caller-supplied DCC segment as scope.
+        let Some((_, instance_hint, _)) = parse_slug(slug) else {
+            continue;
+        };
+        for entry in live
+            .iter()
+            .filter(|entry| instance_hint_matches(instance_hint, entry.instance_id))
+        {
+            let resolved_dcc_type = DccName::parse(&entry.dcc_type);
+            gs.auth
+                .authorize_dispatch(dispatch_context, &resolved_dcc_type)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn call_service(
+    gs: &GatewayState,
+    request: CapabilityCallRequest<'_, '_>,
 ) -> Result<Value, ServiceError> {
+    let CapabilityCallRequest {
+        slug,
+        arguments,
+        meta,
+        dispatch_context,
+        trace_context,
+        agent_context,
+    } = request;
     let record = describe_service(&gs.capability_index, slug)?;
     enforce_record_policy(&gs.policy, GatewayPolicyOperation::Call, &record)?;
     // Discovery-only tools (e.g. dcc_capability_manifest) must not be
@@ -698,6 +784,10 @@ pub async fn call_service(
             .find(|entry| entry.instance_id == record.instance_id);
         return Err(unroutable_instance_error(gs, &record, known.as_ref()));
     };
+    let resolved_dcc_type = DccName::parse(&entry.dcc_type);
+    gs.auth
+        .authorize_dispatch(dispatch_context, &resolved_dcc_type)
+        .map_err(|error| ServiceError::new(error.kind(), error.message()))?;
     super::lease_guard::check_call_owner(entry, meta.as_ref()).map_err(|error| {
         ServiceError::new(
             error.kind(),

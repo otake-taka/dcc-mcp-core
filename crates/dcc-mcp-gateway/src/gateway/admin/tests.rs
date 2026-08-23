@@ -24,7 +24,7 @@ pub(in crate::gateway::admin) mod admin_tests {
     use crate::gateway::state::GatewayState;
     use dcc_mcp_transport::discovery::file_registry::FileRegistry;
 
-    fn make_gateway_state() -> GatewayState {
+    pub(in crate::gateway::admin) fn make_gateway_state() -> GatewayState {
         let dir = tempfile::tempdir().unwrap();
         let registry = Arc::new(FileRegistry::new(dir.path()).unwrap());
         let (yield_tx, _) = watch::channel(false);
@@ -97,7 +97,7 @@ pub(in crate::gateway::admin) mod admin_tests {
         AdminState::new(make_gateway_state())
     }
 
-    fn admin_router() -> Router {
+    pub(in crate::gateway::admin) fn admin_router() -> Router {
         build_admin_router(make_admin_state())
     }
 
@@ -673,14 +673,21 @@ filters:
             &instance_id,
             "maya_primitives__create_sphere",
         );
+        let dispatch_context = gs
+            .auth
+            .authenticate_dispatch(crate::gateway::security::PresentedAuthorization::new(None))
+            .unwrap();
 
         let result = crate::gateway::capability_service::call_service(
             &gs,
-            &slug,
-            json!({"radius": 0.8, "name": "random_sphere_1"}),
-            None,
-            None,
-            None,
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &slug,
+                arguments: json!({"radius": 0.8, "name": "random_sphere_1"}),
+                meta: None,
+                dispatch_context: &dispatch_context,
+                trace_context: None,
+                agent_context: None,
+            },
         )
         .await
         .expect("gateway /v1/call should route sidecar entries via /mcp tools/call");
@@ -749,14 +756,21 @@ filters:
             &instance_id,
             "maya_primitives__create_sphere",
         );
+        let dispatch_context = gs
+            .auth
+            .authenticate_dispatch(crate::gateway::security::PresentedAuthorization::new(None))
+            .unwrap();
 
         let error = crate::gateway::capability_service::call_service(
             &gs,
-            &slug,
-            json!({"radius": 0.8}),
-            None,
-            None,
-            None,
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &slug,
+                arguments: json!({"radius": 0.8}),
+                meta: None,
+                dispatch_context: &dispatch_context,
+                trace_context: None,
+                agent_context: None,
+            },
         )
         .await
         .expect_err("a leased instance must require matching owner metadata");
@@ -768,11 +782,14 @@ filters:
 
         let error = crate::gateway::capability_service::call_service(
             &gs,
-            &slug,
-            json!({"radius": 0.8}),
-            Some(json!({"lease_owner": "workflow-b"})),
-            None,
-            None,
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &slug,
+                arguments: json!({"radius": 0.8}),
+                meta: Some(json!({"lease_owner": "workflow-b"})),
+                dispatch_context: &dispatch_context,
+                trace_context: None,
+                agent_context: None,
+            },
         )
         .await
         .expect_err("a different lease owner must not use the instance");
@@ -784,11 +801,14 @@ filters:
 
         let result = crate::gateway::capability_service::call_service(
             &gs,
-            &slug,
-            json!({"radius": 0.8}),
-            Some(json!({"lease_owner": "workflow-a"})),
-            None,
-            None,
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &slug,
+                arguments: json!({"radius": 0.8}),
+                meta: Some(json!({"lease_owner": "workflow-a"})),
+                dispatch_context: &dispatch_context,
+                trace_context: None,
+                agent_context: None,
+            },
         )
         .await
         .expect("the active lease owner should reach the DCC backend");
@@ -826,11 +846,14 @@ filters:
         }
         let result = crate::gateway::capability_service::call_service(
             &gs,
-            &slug,
-            json!({"radius": 0.8}),
-            None,
-            None,
-            None,
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &slug,
+                arguments: json!({"radius": 0.8}),
+                meta: None,
+                dispatch_context: &dispatch_context,
+                trace_context: None,
+                agent_context: None,
+            },
         )
         .await
         .expect("an expired lease must behave like an unleased instance");
@@ -970,14 +993,21 @@ filters:
         .await;
         let slug =
             crate::gateway::capability::tool_slug("3dsmax", &instance_id, "ui_control__snapshot");
+        let dispatch_context = gs
+            .auth
+            .authenticate_dispatch(crate::gateway::security::PresentedAuthorization::new(None))
+            .unwrap();
 
         let result = crate::gateway::capability_service::call_service(
             &gs,
-            &slug,
-            json!({}),
-            None,
-            None,
-            None,
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &slug,
+                arguments: json!({}),
+                meta: None,
+                dispatch_context: &dispatch_context,
+                trace_context: None,
+                agent_context: None,
+            },
         )
         .await
         .expect("ui-control calls should use the in-process discovery endpoint");
@@ -1758,7 +1788,7 @@ filters:
     }
 
     // ── /api/workers (Phase 4) ────────────────────────────────────────────
-    fn make_service_entry(
+    pub(in crate::gateway::admin) fn make_service_entry(
         dcc_type: &str,
         host: &str,
         port: u16,
@@ -1921,78 +1951,6 @@ filters:
         assert!(w["memory_bytes"].is_null());
         assert!(w["uptime_secs"].as_u64().is_some());
         // summary should reflect 1 live, 0 stale.
-        assert_eq!(body["total"].as_u64(), Some(1));
-        assert_eq!(body["summary"]["live"].as_u64(), Some(1));
-        assert_eq!(body["summary"]["stale"].as_u64(), Some(0));
-    }
-
-    #[tokio::test]
-    async fn test_admin_workers_keeps_booting_failure_rows_visible() {
-        use dcc_mcp_transport::discovery::types::ServiceStatus;
-
-        let gs = make_gateway_state();
-        {
-            let reg = &gs.registry;
-            let mut booting = make_service_entry("3dsmax", "127.0.0.1", 0, Some(4244));
-            booting.status = ServiceStatus::Booting;
-            booting
-                .metadata
-                .insert("failure_reason".into(), "host-rpc connect failed".into());
-            booting
-                .metadata
-                .insert("failure_stage".into(), "host-rpc-connect".into());
-            booting
-                .metadata
-                .insert("host_rpc_uri".into(), "commandport://127.0.0.1:6000".into());
-            booting
-                .metadata
-                .insert("host_rpc_scheme".into(), "commandport".into());
-            booting
-                .metadata
-                .insert("dispatch_status".into(), "unavailable".into());
-            reg.register(booting).unwrap();
-        }
-        let state = AdminState::new(gs);
-        let router = build_admin_router(state);
-        let (status, body) = body_json(router, "/api/workers").await;
-        assert_eq!(status, StatusCode::OK);
-        let workers = body["workers"].as_array().unwrap();
-        assert_eq!(workers.len(), 1, "expected booting worker row");
-        assert_eq!(workers[0]["status"], "booting");
-        assert_eq!(workers[0]["port"], 0);
-        assert_eq!(workers[0]["failure_reason"], "host-rpc connect failed");
-        assert_eq!(workers[0]["failure_stage"], "host-rpc-connect");
-        assert_eq!(workers[0]["host_rpc_scheme"], "commandport");
-        assert_eq!(workers[0]["dispatch_status"], "unavailable");
-        assert_eq!(workers[0]["dispatch_ready"], false);
-        assert_eq!(body["summary"]["unhealthy"].as_u64(), Some(1));
-    }
-
-    #[tokio::test]
-    async fn test_admin_workers_hides_stale_registry_rows() {
-        let gs = make_gateway_state();
-        {
-            let reg = &gs.registry;
-            reg.register(make_service_entry("maya", "127.0.0.1", 18813, Some(4242)))
-                .unwrap();
-
-            let mut stale = make_service_entry("maya", "127.0.0.1", 18814, Some(4243));
-            stale.last_heartbeat = std::time::SystemTime::now() - Duration::from_secs(120);
-            reg.register(stale).unwrap();
-        }
-
-        let state = AdminState::new(gs);
-        let router = build_admin_router(state);
-        let (status, body) = body_json(router, "/api/workers").await;
-
-        assert_eq!(status, StatusCode::OK);
-        let workers = body["workers"].as_array().unwrap();
-        assert_eq!(
-            workers.len(),
-            1,
-            "expected only live workers, got {workers:?}"
-        );
-        assert_eq!(workers[0]["port"], 18813);
         assert_eq!(body["total"].as_u64(), Some(1));
         assert_eq!(body["summary"]["live"].as_u64(), Some(1));
         assert_eq!(body["summary"]["stale"].as_u64(), Some(0));

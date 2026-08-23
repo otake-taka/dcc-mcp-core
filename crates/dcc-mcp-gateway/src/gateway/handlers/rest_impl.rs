@@ -17,6 +17,7 @@ use crate::gateway::capability_service::{
 };
 use crate::gateway::response_codec::{compact_call_batch_payload, compact_describe_payload};
 use crate::gateway::search_telemetry::{SearchTelemetryInput, search_id_from_payload};
+use dcc_mcp_models::DccName;
 use dcc_mcp_transport::discovery::types::{GATEWAY_SENTINEL_DCC_TYPE, ServiceEntry};
 
 use super::rest_support::*;
@@ -1084,11 +1085,23 @@ pub async fn handle_v1_call(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    let ingress = match DispatchIngress::authenticate(&gs.auth, headers) {
+        Ok(ingress) => ingress,
+        Err(rejection) => {
+            return dispatch_auth_error_response(
+                &rejection.headers,
+                &body,
+                &rejection.error,
+                body.get("calls").and_then(Value::as_array).is_some(),
+            );
+        }
+    };
+    let headers = &ingress.headers;
     let trace_context = TraceContext::from_headers(&headers);
 
     // Batch path: when `calls` array is present, delegate to batch infrastructure.
     if body.get("calls").and_then(Value::as_array).is_some() {
-        return match call_batch_with_admin_trace(&gs, &headers, &body, trace_context.clone()).await
+        return match call_batch_with_admin_trace(&gs, &ingress, &body, trace_context.clone()).await
         {
             Ok(value) => {
                 let compact = compact_call_batch_payload(&value);
@@ -1158,7 +1171,7 @@ pub async fn handle_v1_call(
 
     match call_service_with_admin_trace(
         &gs,
-        &headers,
+        &ingress,
         RestCallTraceRequest {
             method: "v1/call",
             slug,
@@ -1208,6 +1221,18 @@ pub async fn handle_v1_dcc_instance_call(
     Path((dcc_type, instance_id)): Path<(String, String)>,
     Json(body): Json<Value>,
 ) -> Response {
+    let ingress = match DispatchIngress::authenticate(&gs.auth, headers) {
+        Ok(ingress) => ingress,
+        Err(rejection) => {
+            return dispatch_auth_error_response(
+                &rejection.headers,
+                &body,
+                &rejection.error,
+                false,
+            );
+        }
+    };
+    let headers = &ingress.headers;
     let trace_context = TraceContext::from_headers(&headers);
     let backend_tool = body
         .get("backend_tool")
@@ -1231,7 +1256,6 @@ pub async fn handle_v1_dcc_instance_call(
         );
     };
 
-    refresh_all_live_backends(&gs, RefreshReason::Periodic).await;
     let metadata = RestResponseMetadata::from_trace_context(&trace_context)
         .with_index_generation(index_generation(&gs.capability_index));
 
@@ -1258,6 +1282,16 @@ pub async fn handle_v1_dcc_instance_call(
         );
     }
 
+    let resolved_dcc_type = DccName::parse(&entry.dcc_type);
+    if let Err(error) = gs
+        .auth
+        .authorize_dispatch(&ingress.context, &resolved_dcc_type)
+    {
+        return dispatch_auth_error_response(headers, &body, &error, false);
+    }
+
+    refresh_all_live_backends(&gs, RefreshReason::Periodic).await;
+
     let slug = tool_slug(&entry.dcc_type, &entry.instance_id, backend_tool);
     let arguments =
         match dcc_mcp_jsonrpc::coerce_tool_arguments_object(body.get("arguments").cloned()) {
@@ -1276,7 +1310,7 @@ pub async fn handle_v1_dcc_instance_call(
 
     match call_service_with_admin_trace(
         &gs,
-        &headers,
+        &ingress,
         RestCallTraceRequest {
             method: "v1/dcc/instances/call",
             slug: &slug,
@@ -1348,8 +1382,15 @@ pub async fn handle_v1_call_batch(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    let ingress = match DispatchIngress::authenticate(&gs.auth, headers) {
+        Ok(ingress) => ingress,
+        Err(rejection) => {
+            return dispatch_auth_error_response(&rejection.headers, &body, &rejection.error, true);
+        }
+    };
+    let headers = &ingress.headers;
     let trace_context = TraceContext::from_headers(&headers);
-    match call_batch_with_admin_trace(&gs, &headers, &body, trace_context.clone()).await {
+    match call_batch_with_admin_trace(&gs, &ingress, &body, trace_context.clone()).await {
         Ok(value) => {
             let compact = compact_call_batch_payload(&value);
             let metadata = RestResponseMetadata::from_trace_context(&trace_context)
@@ -1387,6 +1428,10 @@ pub async fn handle_v1_call_batch(
 #[cfg(test)]
 #[path = "rest_impl_tests.rs"]
 mod rest_impl_tests;
+
+#[cfg(test)]
+#[path = "rest_impl_call_shape_tests.rs"]
+mod rest_impl_call_shape_tests;
 
 #[cfg(test)]
 #[path = "rest_impl_batch_tests.rs"]

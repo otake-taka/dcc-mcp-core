@@ -140,3 +140,119 @@ fn empty_bearer_value_is_malformed() {
         .unwrap_err();
     assert!(matches!(err, AuthError::MalformedBearer));
 }
+
+#[test]
+fn token_debug_never_exposes_secret() {
+    let secret = "do-not-print-this-bearer-secret";
+    let auth = GatewayAuth {
+        tokens: vec![GatewayAuthToken::for_dcc(secret, ["maya"])],
+    };
+
+    let debug = format!("{auth:?}");
+    assert!(!debug.contains(secret));
+    assert!(debug.contains("[REDACTED]"));
+}
+
+#[test]
+fn enabled_auth_rejects_unauthenticated_non_read_only_call() {
+    let auth = GatewayAuth {
+        tokens: vec![GatewayAuthToken::any_dcc("studio-token")],
+    };
+    let err = auth
+        .authenticate_dispatch(PresentedAuthorization::new(None))
+        .err()
+        .unwrap();
+    assert_eq!(err.kind(), "unauthorized");
+    assert!(!err.message().contains("studio-token"));
+}
+
+#[test]
+fn enabled_auth_requires_token_for_executable_read_only_call() {
+    let auth = GatewayAuth {
+        tokens: vec![GatewayAuthToken::any_dcc("studio-token")],
+    };
+    let anonymous = auth.authenticate_dispatch(PresentedAuthorization::new(None));
+    let authenticated = auth
+        .authenticate_dispatch(PresentedAuthorization::new(Some("Bearer studio-token")))
+        .unwrap();
+
+    assert!(anonymous.is_err());
+    assert!(
+        auth.authorize_dispatch(&authenticated, &dcc_mcp_models::DccName::Photoshop)
+            .is_ok()
+    );
+}
+
+#[test]
+fn enabled_auth_requires_credentials_for_every_resolved_dcc_family() {
+    let auth = GatewayAuth {
+        tokens: vec![GatewayAuthToken::any_dcc("studio-token")],
+    };
+    assert!(
+        auth.authenticate_dispatch(PresentedAuthorization::new(None))
+            .is_err()
+    );
+}
+
+#[test]
+fn enabled_auth_applies_existing_dcc_scope_to_calls() {
+    let auth = GatewayAuth {
+        tokens: vec![GatewayAuthToken::for_dcc("maya-only", ["maya"])],
+    };
+    let context = auth
+        .authenticate_dispatch(PresentedAuthorization::new(Some("Bearer maya-only")))
+        .unwrap();
+
+    assert!(
+        auth.authorize_dispatch(&context, &dcc_mcp_models::DccName::Maya)
+            .is_ok()
+    );
+    let err = auth
+        .authorize_dispatch(&context, &dcc_mcp_models::DccName::Nuke)
+        .unwrap_err();
+    assert_eq!(err.kind(), "unauthorized");
+    assert_eq!(err.http_status(), 401);
+    assert!(!err.message().contains("nuke"));
+}
+
+#[test]
+fn disabled_auth_preserves_historical_non_read_only_calls() {
+    let auth = GatewayAuth::disabled();
+    let context = auth
+        .authenticate_dispatch(PresentedAuthorization::new(None))
+        .unwrap();
+
+    assert!(
+        auth.authorize_dispatch(&context, &dcc_mcp_models::DccName::Nuke)
+            .is_ok()
+    );
+}
+
+#[test]
+fn dispatch_context_cannot_be_reused_with_a_different_authority() {
+    let disabled = GatewayAuth::disabled();
+    let disabled_context = disabled
+        .authenticate_dispatch(PresentedAuthorization::new(None))
+        .unwrap();
+    let enabled = GatewayAuth {
+        tokens: vec![GatewayAuthToken::any_dcc("studio-token")],
+    };
+
+    assert!(
+        enabled
+            .authorize_dispatch(&disabled_context, &dcc_mcp_models::DccName::Nuke)
+            .is_err()
+    );
+
+    let other_enabled = GatewayAuth {
+        tokens: vec![GatewayAuthToken::any_dcc("studio-token")],
+    };
+    let other_context = other_enabled
+        .authenticate_dispatch(PresentedAuthorization::new(Some("Bearer studio-token")))
+        .unwrap();
+    assert!(
+        enabled
+            .authorize_dispatch(&other_context, &dcc_mcp_models::DccName::Nuke)
+            .is_err()
+    );
+}

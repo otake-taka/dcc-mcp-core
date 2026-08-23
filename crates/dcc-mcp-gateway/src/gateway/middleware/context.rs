@@ -17,10 +17,11 @@ use crate::gateway::admin::trace::{
 /// (slug + DCC + instance), the originating session, and the raw
 /// argument value.
 ///
-/// Middlewares may mutate `metadata` to pass small key/value hints to
-/// later stages, but the routing fields (`tool_slug`, `dcc_type`,
-/// `instance_id`) are owned by the dispatch handler and should not be
-/// rewritten by middleware.
+/// Before-call middlewares may rewrite route-bearing `args`; REST single-call
+/// handlers also accept a `tool_slug` rewrite. The dispatch handler re-resolves
+/// and re-authorizes that effective target. `dcc_type` and `instance_id` are
+/// projections refreshed by the handler rather than authorization claims
+/// supplied by middleware.
 #[derive(Debug, Clone)]
 pub struct CallContext {
     /// JSON-RPC method name as it arrived from the client (e.g.

@@ -653,6 +653,25 @@ async fn handle_resources_read(gs: &GatewayState, id: Value, req: &JsonRpcReques
     super::resources::handle_resources_read(gs, id, req).await
 }
 
+fn dispatch_slug_for_wrapper<'a>(tool: &str, args: &'a Value) -> Option<&'a str> {
+    let first_batch_slug = || {
+        args.get("calls")
+            .and_then(Value::as_array)
+            .and_then(|calls| calls.first())
+            .and_then(|call| call.get("tool_slug"))
+            .and_then(Value::as_str)
+    };
+    match tool {
+        "call" => args
+            .get("tool_slug")
+            .and_then(Value::as_str)
+            .or_else(first_batch_slug),
+        "call_tool" => args.get("tool_slug").and_then(Value::as_str),
+        "call_tools" => first_batch_slug(),
+        _ => None,
+    }
+}
+
 async fn handle_resource_subscription(
     gs: &GatewayState,
     id: Value,
@@ -677,6 +696,22 @@ async fn handle_tools_call(
         .and_then(|params| params.get("name"))
         .and_then(|value| value.as_str())
         .unwrap_or("");
+    let requires_dispatch_auth = matches!(tool, "call" | "call_tool" | "call_tools");
+    let ingress = if requires_dispatch_auth {
+        match DispatchIngress::authenticate(&gs.auth, headers.clone()) {
+            Ok(ingress) => Some(ingress),
+            Err(rejection) => return mcp_dispatch_auth_rejection(id, &rejection.error),
+        }
+    } else {
+        None
+    };
+    let unprotected_headers;
+    let headers = if let Some(ingress) = ingress.as_ref() {
+        &ingress.headers
+    } else {
+        unprotected_headers = DispatchIngress::sanitized_headers(&gs.auth, headers.clone());
+        &unprotected_headers
+    };
     let args_raw = req
         .params
         .as_ref()
@@ -699,6 +734,16 @@ async fn handle_tools_call(
         .as_ref()
         .and_then(|params| params.get("_meta"))
         .cloned();
+    if let Some(ingress) = ingress.as_ref()
+        && let Err(error) = crate::gateway::capability_service::authorize_known_dispatch_targets(
+            &gs,
+            &ingress.context,
+            &args,
+        )
+        .await
+    {
+        return mcp_dispatch_auth_rejection(id, &error);
+    }
     let agent_context =
         crate::gateway::admin::trace::AgentContext::from_request_parts_with_server_network(
             headers,
@@ -713,33 +758,7 @@ async fn handle_tools_call(
         headers,
         id_str.to_string(),
     );
-    let first_batch_slug = || {
-        args.get("calls")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|obj| obj.get("tool_slug"))
-            .and_then(Value::as_str)
-    };
-    let resolved_slug = match tool {
-        "call" => args
-            .get("tool_slug")
-            .and_then(Value::as_str)
-            .or_else(first_batch_slug),
-        "call_tool" => args.get("tool_slug").and_then(Value::as_str),
-        "call_tools" => first_batch_slug(),
-        _ => None,
-    };
-
-    {
-        let mut pending = gs.pending_calls.write().await;
-        pending.insert(
-            id_str.to_string(),
-            super::super::state::PendingCall {
-                backend_url: String::new(),
-                backend_request_id: id_str.to_string(),
-            },
-        );
-    }
+    let resolved_slug = dispatch_slug_for_wrapper(tool, &args);
 
     // ── Middleware: BeforeCall ────────────────────────────────────────────
     let mut ctx = crate::gateway::middleware::CallContext::new("tools/call", id_str, args.clone())
@@ -762,8 +781,6 @@ async fn handle_tools_call(
     if !gs.middleware_chain.is_empty()
         && let Err(e) = gs.middleware_chain.run_before(&mut ctx).await
     {
-        let mut pending = gs.pending_calls.write().await;
-        pending.remove(id_str);
         let msg = e.to_string();
         crate::gateway::metrics::record_gateway_governance_event(e.governance_category(), e.kind());
         crate::gateway::agent_telemetry::AgentWorkflowEvent::new("gateway.call", "mcp")
@@ -797,18 +814,51 @@ async fn handle_tools_call(
         });
     }
 
-    // Capture input after before-middlewares so trace storage sees redacted args.
-    {
-        use crate::gateway::admin::trace::{MAX_INPUT_BYTES, TracePayload};
-        ctx.input_payload = Some(TracePayload::from_input_value(&ctx.args, MAX_INPUT_BYTES));
-    }
-
     // Use potentially-redacted args from context.
     let effective_args = if gs.middleware_chain.is_empty() {
         args
     } else {
         ctx.args.clone()
     };
+    if let Some(ingress) = ingress.as_ref()
+        && !gs.middleware_chain.is_empty()
+        && let Err(error) = crate::gateway::capability_service::authorize_known_dispatch_targets(
+            gs,
+            &ingress.context,
+            &effective_args,
+        )
+        .await
+    {
+        return mcp_dispatch_auth_rejection(id, &error);
+    }
+    let effective_slug = dispatch_slug_for_wrapper(tool, &effective_args);
+    ctx.tool_slug = Some(effective_slug.unwrap_or(tool).to_string());
+    ctx.dcc_type = None;
+    ctx.instance_id = None;
+    if let Some((dcc_type, instance_hint, _)) = effective_slug.and_then(parse_slug) {
+        ctx.dcc_type = Some(dcc_type.to_string());
+        ctx.instance_id = Some(instance_hint.to_string());
+    } else if let Some(dcc_type) = effective_args
+        .get("dcc_type")
+        .or_else(|| effective_args.get("dcc"))
+        .and_then(Value::as_str)
+    {
+        ctx.dcc_type = Some(dcc_type.to_string());
+    }
+    {
+        let mut pending = gs.pending_calls.write().await;
+        pending.insert(
+            id_str.to_string(),
+            super::super::state::PendingCall {
+                backend_url: String::new(),
+                backend_request_id: id_str.to_string(),
+            },
+        );
+    }
+    {
+        use crate::gateway::admin::trace::{MAX_INPUT_BYTES, TracePayload};
+        ctx.input_payload = Some(TracePayload::from_input_value(&ctx.args, MAX_INPUT_BYTES));
+    }
     emit_mcp_traffic_frame(
         gs,
         &ctx,
@@ -842,6 +892,7 @@ async fn handle_tools_call(
         tool,
         &effective_args,
         meta.as_ref(),
+        ingress.as_ref().map(|ingress| &ingress.context),
         Some(session_id),
         Some(&ctx.trace_context),
         ctx.agent_context.as_ref(),
@@ -876,7 +927,7 @@ async fn handle_tools_call(
                     dispatch_ns,
                     response_ns.saturating_sub(dispatch_ns),
                 )
-                .with_attr("tool_slug", tool)
+                .with_attr("tool_slug", effective_slug.unwrap_or(tool))
                 .with_attr("ok", !is_error),
         );
         ctx.output_payload = Some(TracePayload::from_str(&text, MAX_OUTPUT_BYTES));
@@ -931,6 +982,22 @@ async fn handle_tools_call(
         },
     );
     response
+}
+
+fn mcp_dispatch_auth_rejection(id: Value, error: &crate::gateway::security::AuthError) -> Value {
+    let text = json!({
+        "success": false,
+        "error": {"kind": error.kind(), "message": error.message()}
+    })
+    .to_string();
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": true
+        }
+    })
 }
 
 struct McpTrafficFrame<'a> {

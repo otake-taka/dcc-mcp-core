@@ -497,6 +497,34 @@ cfg = McpHttpConfig(
 
 两个字段在返回的 `McpHttpConfig` 实例上也可作为 getter/setter 访问。
 
+## Security（issue #1365）
+
+默认的 `GatewayAuth::disabled()` 保留历史 local-trust 行为。独立 gateway
+填充 `GatewayConfig::auth` 后，以下路径必须提供
+`Authorization: Bearer <token>`：
+
+- `POST /v1/instances/register`
+- canonical REST call route：`/v1/call`、`/v1/call_batch`、
+  `/v1/dcc/{dcc_type}/instances/{instance_id}/call`
+- gateway MCP `tools/call` wrapper：`call`、`call_tool`、`call_tools`
+- raw proxy：`/mcp/{instance_id}`、`/mcp/dcc/{dcc_type}`
+
+每个 `GatewayAuthToken` 可设置 `allowed_dcc`。Gateway 首先在 ingress
+验证 credential；missing、malformed 和 unknown token 会在 backend discovery、
+middleware、pending-call bookkeeping 与 telemetry 之前，以同一个
+`unauthorized` contract fail closed。对于已知 call target，gateway 会在
+middleware 之前根据 live registry 解析出的 authoritative `dcc_type` 检查
+scope，并在实际 dispatch 前再次检查，避免 registry 变化复用旧决定；caller
+提供的 agent context、lease owner 或 routing hint 都不是认证 identity。所有 canonical backend call 都需要
+token，不会根据不完整的 capability annotation 推断 anonymous read-only
+例外，因此 inspection、controlled scripting、graph mutation、save、render
+等能力在认证后使用同一条 call path。
+
+启用 gateway auth 时，raw proxy 会消费并移除 gateway bearer，不会把它转发
+给 DCC backend；禁用 auth 时保留历史 header forwarding。Native gateway
+admin/lifecycle/skill/update mutation 和直接 per-DCC `McpHttpServer` 不属于
+这个 bounded gateway dispatch contract。
+
 ## 非目标
 
 HTTP/2 多路复用调优以及路由缓存的多后端故障转移

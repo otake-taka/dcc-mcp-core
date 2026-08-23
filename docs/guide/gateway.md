@@ -1236,7 +1236,7 @@ boundary that the local-trust `FileRegistry` does not cover anymore.
 This section is the operator-facing contract for authn / authz / TLS on
 that boundary.
 
-### Authentication: bearer tokens on the registration plane
+### Authentication: bearer tokens for registration and backend dispatch
 
 The Rust API exposes
 [`dcc_mcp_gateway::GatewayAuth`](https://docs.rs/dcc-mcp-gateway) and
@@ -1269,7 +1269,13 @@ section).
 ### Wire format
 
 Authenticated clients must send the standard `Authorization` header on
-every request the auth layer protects:
+every request the auth layer protects. This includes
+`POST /v1/instances/register`, executable REST calls (`/v1/call`,
+`/v1/call_batch`, and `/v1/dcc/{dcc_type}/instances/{instance_id}/call`),
+gateway MCP `tools/call` execution (`call`, `call_tool`, and `call_tools`),
+and both raw MCP proxy routes (`/mcp/{instance_id}` and
+`/mcp/dcc/{dcc_type}`). Discovery-only search and describe routes are
+unchanged.
 
 ```http
 POST /v1/instances/register HTTP/1.1
@@ -1287,20 +1293,33 @@ avoid timing leaks.
 
 Every `GatewayAuthToken` may declare an `allowed_dcc` set. On
 `POST /v1/instances/register`, the gateway compares the request's
-`dcc_type` against this set:
+`dcc_type` against this set. For executable calls, it compares the resolved
+live registry row's `dcc_type`; caller-provided agent context, lease owner,
+or an unverified routing hint never supplies authentication identity or scope.
 
-- `allowed_dcc == None` — token may register any DCC type.
+- `allowed_dcc == None` — token may register or call any DCC type.
 - `allowed_dcc == Some({"maya", "blender"})` — only registrations with
-  `dcc_type ∈ {"maya", "blender"}` succeed.
+  `dcc_type ∈ {"maya", "blender"}` and calls resolved to those DCC types
+  succeed.
 
-Other endpoints (call, read-resources, admin) currently re-use the
-trust granted at registration time; per-call scope is tracked in
-follow-ups under epic #1367.
+When at least one token is configured, every executable backend call listed
+above requires a valid scoped token. Core deliberately does not infer an
+anonymous read-only exemption from incomplete capability annotations. Native
+gateway admin, lifecycle, skill-management, and update mutations remain
+outside this bounded dispatch contract.
+
+Credential validity is checked at executable ingress before backend discovery,
+middleware, pending-call bookkeeping, or telemetry. For known call targets,
+DCC scope is checked against the live registry before middleware and checked
+again immediately before dispatch, so a registry change cannot reuse an older
+decision. Authentication does not narrow the provider capability: inspection,
+controlled scripting, graph mutation, save, render, diagnostics, and
+verification all use the same authenticated call path.
 
 ### Error envelope
 
-When auth fails, the gateway returns a structured JSON envelope. The
-shape is agent-friendly and mirrors the rest of the `/v1/*` surface:
+When registration auth fails, the gateway returns a structured JSON envelope.
+The shape is agent-friendly and mirrors the rest of the `/v1/*` surface:
 
 ```json
 {
@@ -1323,15 +1342,26 @@ shape is agent-friendly and mirrors the rest of the `/v1/*` surface:
 `dcc_scope_mismatch` additionally carries `error.dcc_type` with the
 rejected DCC name to keep the negative path debuggable from logs.
 
+Executable REST, MCP, batch, and raw-proxy calls instead collapse missing,
+malformed, unknown, and wrong-scope credentials into one `unauthorized`
+failure. This stable fail-closed envelope prevents the call surface from
+becoming a credential or scope oracle. REST failures use HTTP 401; gateway MCP
+wrappers return a tool error, while raw MCP proxies preserve the request's
+JSON-RPC id (and omit notification-only batch entries).
+
 ### TLS termination
 
 The gateway daemon **does not** terminate TLS in-binary; that
 intentionally matches the stance taken by `dcc-mcp-tunnel-relay`. Run
 the daemon behind a reverse proxy (nginx, Caddy, a cloud load balancer)
 that owns the certificate lifecycle, HTTP/2, rate limiting, and any
-mTLS requirements your environment needs. The bearer-token contract
-above continues to work end-to-end as long as the proxy forwards the
-`Authorization` header verbatim.
+mTLS requirements your environment needs. The edge proxy must forward the
+client's `Authorization` header to the gateway. When gateway authentication is
+enabled, the gateway consumes that bearer and removes it before forwarding a
+raw MCP proxy request to a DCC backend. When authentication is disabled, raw
+proxy routes retain their historical header-forwarding behaviour. A backend
+that requires a separate credential needs a named backend-owned authentication
+contract; the current gateway does not provide a second credential lane.
 
 ### Hardening checklist for internet-exposed deployments
 
@@ -1346,8 +1376,9 @@ above continues to work end-to-end as long as the proxy forwards the
   at `tests/vrs/traces/core-1365-gateway-auth-negative.jsonl` covers
   the rejection envelopes and can be replayed against any gateway under
   test.
-- Rate-limit + WAF rules on the reverse proxy for the `/v1/instances/*`
-  paths so token brute-force is bounded.
+- Rate-limit + WAF rules on the reverse proxy for `/v1/instances/register`,
+  executable REST/MCP routes, and raw MCP proxies so token brute-force is
+  bounded.
 
 ## Event webhooks
 

@@ -9,12 +9,13 @@ use super::*;
 /// only exposes `search`, `describe`, `load_skill`, and `call`. This router
 /// keeps legacy wrapper names and lease tools callable as hidden compatibility
 /// routes, while steering new clients toward the canonical four-tool workflow.
-pub async fn route_tools_call(
+pub(crate) async fn route_tools_call(
     gs: &GatewayState,
     tool: &str,
     args: &Value,
     meta: Option<&Value>,
-    _client_session_id: Option<&str>,
+    dispatch_context: Option<&crate::gateway::security::DispatchRequestContext<'_>>,
+    client_session_id: Option<&str>,
     trace_context: Option<&crate::gateway::admin::trace::TraceContext>,
     agent_context: Option<&crate::gateway::admin::trace::AgentContext>,
 ) -> (String, bool) {
@@ -27,7 +28,7 @@ pub async fn route_tools_call(
                     args,
                     meta,
                     trace_context,
-                    _client_session_id,
+                    client_session_id,
                     agent_context,
                 )
                 .await,
@@ -39,7 +40,20 @@ pub async fn route_tools_call(
 
     // ── Hidden compatibility routes ──────────────────────────────────
     match tool {
-        "call" => return tool_call(gs, args, meta, trace_context, agent_context).await,
+        "call" => {
+            let Some(dispatch_context) = dispatch_context else {
+                return dispatch_auth_required();
+            };
+            return tool_call(
+                gs,
+                args,
+                meta,
+                dispatch_context,
+                trace_context,
+                agent_context,
+            )
+            .await;
+        }
         "lease" => return to_text_result(tool_lease(gs, args).await),
         "load_skill" => {
             let (text, is_error) = tool_load_skill(gs, args).await;
@@ -62,15 +76,39 @@ pub async fn route_tools_call(
         "release_dcc_instance" => return to_text_result(tool_release_instance(gs, args).await),
         "search_tools" => {
             return to_text_result(
-                tool_search_tools(gs, args, trace_context, _client_session_id, agent_context).await,
+                tool_search_tools(gs, args, trace_context, client_session_id, agent_context).await,
             );
         }
         "describe_tool" => {
             return to_text_result(tool_describe_tool(gs, args, meta, trace_context).await);
         }
-        "call_tool" => return tool_call_tool(gs, args, meta, trace_context, agent_context).await,
+        "call_tool" => {
+            let Some(dispatch_context) = dispatch_context else {
+                return dispatch_auth_required();
+            };
+            return tool_call_tool(
+                gs,
+                args,
+                meta,
+                dispatch_context,
+                trace_context,
+                agent_context,
+            )
+            .await;
+        }
         "call_tools" => {
-            return tool_call_tools(gs, args, meta, trace_context, agent_context).await;
+            let Some(dispatch_context) = dispatch_context else {
+                return dispatch_auth_required();
+            };
+            return tool_call_tools(
+                gs,
+                args,
+                meta,
+                dispatch_context,
+                trace_context,
+                agent_context,
+            )
+            .await;
         }
         _ => {}
     }
@@ -99,4 +137,18 @@ pub async fn route_tools_call(
          parameters inside `arguments` (e.g. export_fbx uses `path`)."
     );
     (hint, true)
+}
+
+fn dispatch_auth_required() -> (String, bool) {
+    (
+        serde_json::to_string(&json!({
+            "success": false,
+            "error": {
+                "kind": "unauthorized",
+                "message": "Valid bearer authorization is required for this operation."
+            }
+        }))
+        .expect("static authorization error is serializable"),
+        true,
+    )
 }

@@ -22,6 +22,49 @@ pub(crate) use super::state::{GatewayState, ResolveInstanceError};
 pub(crate) use dcc_mcp_jsonrpc::negotiate_protocol_version;
 pub(crate) use dcc_mcp_transport::discovery::types::ServiceStatus;
 
+/// One classified, secret-free view of an executable gateway request.
+///
+/// The gateway bearer is consumed at ingress when authentication is enabled;
+/// downstream handlers receive only the resulting grant and sanitized headers.
+/// With authentication disabled, headers retain their historical forwarding
+/// behaviour.
+struct DispatchIngress<'auth> {
+    context: super::security::DispatchRequestContext<'auth>,
+    headers: HeaderMap,
+}
+
+struct DispatchIngressRejection {
+    error: super::security::AuthError,
+    headers: HeaderMap,
+}
+
+impl<'auth> DispatchIngress<'auth> {
+    fn authenticate(
+        auth: &'auth super::security::GatewayAuth,
+        mut headers: HeaderMap,
+    ) -> Result<Self, DispatchIngressRejection> {
+        let context = auth.authenticate_dispatch(super::security::PresentedAuthorization::new(
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+        ));
+        if auth.is_enabled() {
+            headers.remove(axum::http::header::AUTHORIZATION);
+        }
+        match context {
+            Ok(context) => Ok(Self { context, headers }),
+            Err(error) => Err(DispatchIngressRejection { error, headers }),
+        }
+    }
+
+    fn sanitized_headers(auth: &super::security::GatewayAuth, mut headers: HeaderMap) -> HeaderMap {
+        if auth.is_enabled() {
+            headers.remove(axum::http::header::AUTHORIZATION);
+        }
+        headers
+    }
+}
+
 #[cfg(feature = "admin")]
 mod debug_openapi;
 mod lifecycle_impl;

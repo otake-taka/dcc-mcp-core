@@ -218,7 +218,7 @@ print(f"Maya MCP 服务器: {handle.mcp_url()}")
 
 ## 网关
 
-当多个 DCC 实例同时启动时，其中一个会自动成为**网关** — 一个统一的 `/mcp` 入口点和 `/v1/*` REST 门面。自 v0.15 起，网关不会把所有后端 action 合并进 `tools/list`；它保持 MCP 表面有界，并通过 search/describe/call 原语路由后端能力。
+当多个 DCC 实例同时启动时，其中一个会自动成为**网关** — 一个统一的 `/mcp` 入口点和 `/v1/*` REST 门面。自 v0.15 起，网关不会把所有后端 action 合并进 `tools/list`；它保持 MCP 表面有界，并通过 `search`、`describe`、`load_skill`、`call` 四个工具路由能力。
 
 ### 工作原理
 
@@ -235,23 +235,30 @@ print(f"Maya MCP 服务器: {handle.mcp_url()}")
 | `/instances` | GET | 所有活跃实例的 JSON 列表 |
 | `/v1/instances` | GET | 实例发现的 REST 别名 |
 | `/health` | GET | `{"ok": true}` 健康检查 |
-| `/mcp` | POST | 有界 MCP 端点，只暴露网关发现原语（`search`、`describe`） |
+| `/mcp` | POST | 有界 MCP 端点，广告 `search`、`describe`、`load_skill`、`call` 四个工具 |
 | `/mcp` | GET | SSE 事件流 — 进度、作业/工作流、资源、prompt 通知 |
 | `/v1/search` | POST | 搜索紧凑后端能力记录 |
 | `/v1/describe` | POST | 获取一个 `tool_slug` 的 schema、annotations 与路由记录 |
 | `/v1/call` | POST | 通过 `tool_slug` 调用一个后端能力 |
-| `/mcp/{instance_id}` | POST | 透明代理到指定实例（底层逃生通道） |
-| `/mcp/dcc/{dcc_type}` | POST | 代理到指定 DCC 类型的最佳实例 |
+| `/mcp/{instance_id}` | POST | 条件代理到指定实例（底层逃生通道） |
+| `/mcp/dcc/{dcc_type}` | POST | 条件代理到指定 DCC 类型的最佳实例 |
+
+只有在 gateway authentication 禁用时，raw proxy route 才保持透明。
+填充 `GatewayConfig::auth` 后，gateway 会按已解析 registry row 的 DCC scope
+认证请求、消费 gateway `Authorization` bearer，并且不会把该 credential
+转发给 backend。
 
 ### 有界 Facade
 
-网关的 `POST /mcp` 是一个统一 MCP 服务器，在 `tools/list` 中只广告只读网关工具：
+网关的 `POST /mcp` 是一个统一 MCP 服务器，在 `tools/list` 中只广告四个网关工具：
 
 | 层级 | 工具 | 用途 |
 |------|------|------|
 | 发现 | `search`、`describe` | 搜索紧凑后端能力记录，并为一个 `tool_slug` 或 `skill_name` 拉取 schema/detail |
+| Skill lifecycle | `load_skill` | 加载声明式 Skill；这是 gateway 自身的 native skill lifecycle，不属于本次 backend dispatch authentication 边界 |
+| Backend dispatch | `call` | 用一个 `tool_slug` 执行单次调用，或用 `calls` 数组执行有序 batch |
 
-后端 action 通过 `tool_slug`（`<dcc>.<id8>.<tool>`）寻址。Agent 不应手写 slug；应从 MCP `search` 或 `POST /v1/search` 获取，用 MCP `describe` 或 `POST /v1/describe` 检查 schema，然后通过 `POST /v1/call` 或 `POST /v1/call_batch` 执行。隐藏 MCP 兼容路由仍接受旧的 `search_tools` / `describe_tool` / `call_tool` / `call_tools` 名称，但它们不再出现在 `tools/list`。
+后端 action 通过 `tool_slug`（`<dcc>.<id8>.<tool>`）寻址。Agent 不应手写 slug；应从 MCP `search` 或 `POST /v1/search` 获取，用 MCP `describe` 或 `POST /v1/describe` 检查 schema，然后通过 MCP `call`、`POST /v1/call` 或 `POST /v1/call_batch` 执行。填充 `GatewayConfig::auth` 时，四个广告工具中只有执行 backend capability 的 `call` 属于当前 dispatch authentication 边界；`load_skill` 仍是 scope 外的 native skill lifecycle。隐藏 MCP 兼容路由仍接受旧的 `search_tools` / `describe_tool` / `call_tool` / `call_tools` 名称，其中 `call_tool` 和 `call_tools` 使用与 `call` 相同的 dispatch authentication，但它们不再出现在 `tools/list`。
 
 #### `gateway://instances` —— 把 DCC 注册表暴露为 MCP 资源（#813 phase 1）
 

@@ -192,13 +192,17 @@ pub struct GatewayConfig {
     /// Admin persistence settings (SQLite, skill-path snapshot, reload hook).
     pub admin_persist: AdminPersistConfig,
 
-    /// Bearer-token authentication for the HTTP registration plane (#1365).
+    /// Bearer-token authentication for HTTP registration and backend dispatch
+    /// (#1365).
     ///
     /// Defaults to [`super::security::GatewayAuth::disabled()`] — every
     /// request is accepted, matching the historical local-trust model.
     /// Populate this with one or more [`super::security::GatewayAuthToken`]
-    /// values when running the daemon mode over a network the operator
-    /// does not fully trust.
+    /// values when running the daemon mode over a network the operator does not
+    /// fully trust. Once populated, registration, canonical REST call routes,
+    /// gateway MCP `call` / `call_tool` / `call_tools`, and raw MCP proxies
+    /// require a matching token scoped to the DCC resolved from the live
+    /// registry row.
     pub auth: super::security::GatewayAuth,
 
     /// URL to fetch the update manifest JSON from (gateway-controlled auto-update).

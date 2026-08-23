@@ -305,8 +305,14 @@ When multiple DCC instances start simultaneously, one automatically becomes the 
 | `/v1/prompts/{name}` | GET | Render one prompt; `?args=<json>` forwards prompt arguments |
 | `/v1/jobs/{id}/events` | GET | SSE stream for one async job |
 | `/v1/jobs/{id}` | DELETE | Cancel one async job |
-| `/mcp/{instance_id}` | POST | Transparent proxy to a specific instance (low-level escape hatch) |
-| `/mcp/dcc/{dcc_type}` | POST | Proxy to the best instance of a DCC type |
+| `/mcp/{instance_id}` | POST | Conditional proxy to a specific instance (low-level escape hatch) |
+| `/mcp/dcc/{dcc_type}` | POST | Conditional proxy to the best instance of a DCC type |
+
+The raw proxy routes are transparent only while gateway authentication is
+disabled. When `GatewayConfig::auth` is populated, the gateway authenticates
+the request against the resolved registry row's DCC scope, consumes the
+gateway `Authorization` bearer, and does not forward that credential to the
+backend.
 
 ### Bounded facade
 

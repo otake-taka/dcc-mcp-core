@@ -57,9 +57,10 @@ pub(super) struct RestCallTraceRequest<'a> {
 
 pub(super) async fn call_service_with_admin_trace(
     gs: &GatewayState,
-    headers: &HeaderMap,
+    ingress: &DispatchIngress<'_>,
     request: RestCallTraceRequest<'_>,
 ) -> Result<Value, ServiceError> {
+    let headers = &ingress.headers;
     let RestCallTraceRequest {
         method,
         slug,
@@ -69,6 +70,14 @@ pub(super) async fn call_service_with_admin_trace(
         trace_context,
     } = request;
     let search_id = search_id_from_payload(request_body);
+
+    crate::gateway::capability_service::authorize_known_dispatch_targets(
+        gs,
+        &ingress.context,
+        request_body,
+    )
+    .await
+    .map_err(|error| ServiceError::new(error.kind(), error.message()))?;
 
     let mut ctx = CallContext::new(method, trace_context.request_id.clone(), arguments.clone())
         .with_tool_slug(slug)
@@ -131,6 +140,24 @@ pub(super) async fn call_service_with_admin_trace(
         return Err(ServiceError::new(err.kind(), message));
     }
 
+    let effective_slug = ctx.tool_slug.clone().unwrap_or_else(|| slug.to_string());
+    if !gs.middleware_chain.is_empty() {
+        crate::gateway::capability_service::authorize_known_dispatch_targets(
+            gs,
+            &ingress.context,
+            &json!({"tool_slug": effective_slug}),
+        )
+        .await
+        .map_err(|error| ServiceError::new(error.kind(), error.message()))?;
+    }
+    ctx.tool_slug = Some(effective_slug.clone());
+    ctx.dcc_type = None;
+    ctx.instance_id = None;
+    if let Some((dcc_type, instance_hint, _)) = parse_slug(&effective_slug) {
+        ctx.dcc_type = Some(dcc_type.to_string());
+        ctx.instance_id = Some(instance_hint.to_string());
+    }
+
     ctx.input_payload = Some(TracePayload::from_input_value(&ctx.args, MAX_INPUT_BYTES));
 
     let effective_arguments = if gs.middleware_chain.is_empty() {
@@ -148,7 +175,7 @@ pub(super) async fn call_service_with_admin_trace(
             leg: "client_to_gateway",
             status: None,
             body: json!({
-            "tool_slug": slug,
+            "tool_slug": effective_slug,
             "arguments": effective_arguments.clone(),
             "meta": meta.clone(),
             }),
@@ -157,22 +184,28 @@ pub(super) async fn call_service_with_admin_trace(
     let dispatch_ns = now_ns();
     let mut result = call_service(
         gs,
-        slug,
-        effective_arguments.clone(),
-        meta.clone(),
-        Some(&ctx.trace_context),
-        ctx.agent_context.as_ref(),
+        crate::gateway::capability_service::CapabilityCallRequest {
+            slug: &effective_slug,
+            arguments: effective_arguments.clone(),
+            meta: meta.clone(),
+            dispatch_context: &ingress.context,
+            trace_context: Some(&ctx.trace_context),
+            agent_context: ctx.agent_context.as_ref(),
+        },
     )
     .await;
     if matches!(&result, Err(err) if crate::gateway::tools::call_error_needs_refresh(err)) {
         refresh_all_live_backends_now(gs, RefreshReason::Periodic).await;
         result = call_service(
             gs,
-            slug,
-            effective_arguments,
-            meta,
-            Some(&ctx.trace_context),
-            ctx.agent_context.as_ref(),
+            crate::gateway::capability_service::CapabilityCallRequest {
+                slug: &effective_slug,
+                arguments: effective_arguments,
+                meta,
+                dispatch_context: &ingress.context,
+                trace_context: Some(&ctx.trace_context),
+                agent_context: ctx.agent_context.as_ref(),
+            },
         )
         .await;
     }
@@ -190,7 +223,7 @@ pub(super) async fn call_service_with_admin_trace(
         gs,
         search_id.as_deref(),
         "call",
-        Some(slug),
+        Some(&effective_slug),
         None,
         !is_error,
         &ctx.trace_context,
@@ -204,7 +237,7 @@ pub(super) async fn call_service_with_admin_trace(
             dispatch_ns,
             response_ns.saturating_sub(dispatch_ns),
         )
-        .with_attr("tool_slug", slug)
+        .with_attr("tool_slug", effective_slug.as_str())
         .with_attr("transport", "rest")
         .with_attr("ok", !is_error);
     if is_error {
@@ -226,7 +259,8 @@ pub(super) async fn call_service_with_admin_trace(
     if !gs.middleware_chain.is_empty()
         && let Err(err) = gs.middleware_chain.run_after(&ctx, &mut call_result).await
     {
-        let selected_hit = selected_search_hit(gs, search_id.as_deref(), Some(slug), None);
+        let selected_hit =
+            selected_search_hit(gs, search_id.as_deref(), Some(&effective_slug), None);
         AgentWorkflowEvent::new("gateway.call", "rest")
             .with_trace_context(Some(&ctx.trace_context))
             .with_agent_context(ctx.agent_context.as_ref())
@@ -234,7 +268,7 @@ pub(super) async fn call_service_with_admin_trace(
             .with_search_id(search_id.as_deref())
             .with_ranker_version(Some(crate::gateway::search_telemetry::RANKER_VERSION))
             .with_route(
-                Some(slug),
+                Some(&effective_slug),
                 None,
                 ctx.dcc_type.as_deref(),
                 ctx.instance_id.as_deref(),
@@ -245,7 +279,7 @@ pub(super) async fn call_service_with_admin_trace(
         return Err(ServiceError::new("middleware-error", err.to_string()));
     }
 
-    let selected_hit = selected_search_hit(gs, search_id.as_deref(), Some(slug), None);
+    let selected_hit = selected_search_hit(gs, search_id.as_deref(), Some(&effective_slug), None);
     let error_kind = result
         .as_ref()
         .err()
@@ -263,7 +297,7 @@ pub(super) async fn call_service_with_admin_trace(
         .with_search_id(search_id.as_deref())
         .with_ranker_version(Some(crate::gateway::search_telemetry::RANKER_VERSION))
         .with_route(
-            Some(slug),
+            Some(&effective_slug),
             None,
             ctx.dcc_type.as_deref(),
             ctx.instance_id.as_deref(),
@@ -291,10 +325,18 @@ pub(super) async fn call_service_with_admin_trace(
 
 pub(super) async fn call_batch_with_admin_trace(
     gs: &GatewayState,
-    headers: &HeaderMap,
+    ingress: &DispatchIngress<'_>,
     request_body: &Value,
     trace_context: TraceContext,
 ) -> Result<Value, ServiceError> {
+    let headers = &ingress.headers;
+    crate::gateway::capability_service::authorize_known_dispatch_targets(
+        gs,
+        &ingress.context,
+        request_body,
+    )
+    .await
+    .map_err(|error| ServiceError::new(error.kind(), error.message()))?;
     let mut ctx = CallContext::new(
         "v1/call_batch",
         trace_context.request_id.clone(),
@@ -345,6 +387,31 @@ pub(super) async fn call_batch_with_admin_trace(
         return Err(ServiceError::new(err.kind(), message));
     }
 
+    if !gs.middleware_chain.is_empty() {
+        crate::gateway::capability_service::authorize_known_dispatch_targets(
+            gs,
+            &ingress.context,
+            &ctx.args,
+        )
+        .await
+        .map_err(|error| ServiceError::new(error.kind(), error.message()))?;
+    }
+
+    let search_id = search_id_from_payload(&ctx.args);
+    let batch_size = call_batch_size(&ctx.args);
+    let first_slug = first_batch_tool_slug(&ctx.args).map(str::to_string);
+    ctx.tool_slug = Some(
+        first_slug
+            .clone()
+            .unwrap_or_else(|| "call_batch".to_string()),
+    );
+    ctx.dcc_type = None;
+    ctx.instance_id = None;
+    if let Some((dcc_type, instance_hint, _)) = first_slug.as_deref().and_then(parse_slug) {
+        ctx.dcc_type = Some(dcc_type.to_string());
+        ctx.instance_id = Some(instance_hint.to_string());
+    }
+
     ctx.input_payload = Some(TracePayload::from_input_value(&ctx.args, MAX_INPUT_BYTES));
     emit_rest_traffic_frame(
         gs,
@@ -363,7 +430,8 @@ pub(super) async fn call_batch_with_admin_trace(
     let result = crate::gateway::tools::gateway_call_batch_inner(
         gs,
         &ctx.args,
-        request_body.get("meta"),
+        ctx.args.get("meta"),
+        &ingress.context,
         Some(&ctx.trace_context),
         ctx.agent_context.as_ref(),
     )
@@ -392,7 +460,7 @@ pub(super) async fn call_batch_with_admin_trace(
             dispatch_ns,
             response_ns.saturating_sub(dispatch_ns),
         )
-        .with_attr("tool_slug", "call_batch")
+        .with_attr("tool_slug", first_slug.as_deref().unwrap_or("call_batch"))
         .with_attr("transport", "rest")
         .with_attr("ok", !is_error);
     if is_error {
@@ -415,10 +483,7 @@ pub(super) async fn call_batch_with_admin_trace(
     );
 
     let mut call_result = CallResult::from_tuple(preview_text, is_error);
-    let search_id = search_id_from_payload(request_body);
-    let batch_size = call_batch_size(request_body);
-    let first_slug = first_batch_tool_slug(request_body);
-    let selected_hit = selected_search_hit(gs, search_id.as_deref(), first_slug, None);
+    let selected_hit = selected_search_hit(gs, search_id.as_deref(), first_slug.as_deref(), None);
     if !gs.middleware_chain.is_empty()
         && let Err(err) = gs.middleware_chain.run_after(&ctx, &mut call_result).await
     {
@@ -428,7 +493,7 @@ pub(super) async fn call_batch_with_admin_trace(
             .with_session_id(ctx.session_id.as_deref())
             .with_search_id(search_id.as_deref())
             .with_ranker_version(Some(crate::gateway::search_telemetry::RANKER_VERSION))
-            .with_route(first_slug, None, None, None)
+            .with_route(first_slug.as_deref(), None, None, None)
             .with_selected_hit(selected_hit.as_ref())
             .with_batch_size(batch_size)
             .with_outcome(false, Some("middleware-error"))
@@ -448,7 +513,7 @@ pub(super) async fn call_batch_with_admin_trace(
         .with_session_id(ctx.session_id.as_deref())
         .with_search_id(search_id.as_deref())
         .with_ranker_version(Some(crate::gateway::search_telemetry::RANKER_VERSION))
-        .with_route(first_slug, None, None, None)
+        .with_route(first_slug.as_deref(), None, None, None)
         .with_selected_hit(selected_hit.as_ref())
         .with_batch_size(batch_size)
         .with_outcome(

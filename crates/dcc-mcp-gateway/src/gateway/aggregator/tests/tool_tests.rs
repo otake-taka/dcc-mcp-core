@@ -1301,13 +1301,20 @@ async fn load_skill_for_sidecar_row_uses_discovery_endpoint() {
         json!(["radius"])
     );
 
+    let dispatch_context = gs
+        .auth
+        .authenticate_dispatch(crate::gateway::security::PresentedAuthorization::new(None))
+        .unwrap();
     let call_result = crate::gateway::capability_service::call_service(
         &gs,
-        canonical_target,
-        json!({"radius": 2.0}),
-        None,
-        None,
-        None,
+        crate::gateway::capability_service::CapabilityCallRequest {
+            slug: canonical_target,
+            arguments: json!({"radius": 2.0}),
+            meta: None,
+            dispatch_context: &dispatch_context,
+            trace_context: None,
+            agent_context: None,
+        },
     )
     .await
     .expect("canonical post-load target must be callable");
@@ -1486,13 +1493,20 @@ async fn load_skill_preserves_existing_index_when_v1_search_fails() {
         .map(|hit| hit.record.tool_slug.clone())
         .expect("gateway search must find the injected mGear tool");
 
+    let dispatch_context = gs
+        .auth
+        .authenticate_dispatch(crate::gateway::security::PresentedAuthorization::new(None))
+        .unwrap();
     let call_result = crate::gateway::capability_service::call_service(
         &gs,
-        &injected_slug,
-        json!({"detail": true}),
-        None,
-        None,
-        None,
+        crate::gateway::capability_service::CapabilityCallRequest {
+            slug: &injected_slug,
+            arguments: json!({"detail": true}),
+            meta: None,
+            dispatch_context: &dispatch_context,
+            trace_context: None,
+            agent_context: None,
+        },
     )
     .await
     .expect("gateway call must route the injected slug");

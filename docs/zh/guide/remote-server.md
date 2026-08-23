@@ -73,10 +73,15 @@ cfg = McpHttpConfig(
 
 ## Auth
 
-当前原生 `McpHttpServer` / gateway 尚未实现请求级认证 enforcement。
+当前原生的 per-DCC `McpHttpServer` 尚未实现请求级认证 enforcement。
 Python 的 `ApiKeyConfig` 和 `OAuthConfig` 是给工具作者与未来服务器接线
 使用的声明式 helper；设置 `cfg.api_key` 或 `cfg.enable_oauth` 目前不是
 可依赖的运行时安全边界。
+
+独立的 Rust gateway 不同：填充 `GatewayConfig::auth` 后，会对 HTTP 注册、
+canonical REST/MCP call wrapper 和 raw MCP proxy route 执行 Bearer 认证。
+这不会保护客户端直接连接 per-DCC `McpHttpServer` 的路径；该 listener
+仍应只绑定 localhost，或由它自己的边界认证保护。
 
 面向互联网部署时，把 MCP 端点放在反向代理或专用 OAuth 网关后面，并让
 DCC 进程自身只绑定 localhost。避免在 `/mcp` 上使用 HTTP Basic Auth：

@@ -1,5 +1,4 @@
-//! Bearer-token authentication for the gateway HTTP registration plane
-//! (#1365).
+//! Bearer-token authentication for gateway registration and backend dispatch.
 //!
 //! This module implements the **minimum** viable authentication and
 //! scope-enforcement layer required by epic #1367 to close the local-trust
@@ -12,40 +11,71 @@
 //!
 //! 2. **One header, one token.** When auth is enabled, callers must send
 //!    `Authorization: Bearer <secret>`. The secret is matched against a
-//!    static list of pre-shared tokens. No JWT, no OAuth dance — those
-//!    plug in through `dcc-mcp-actions::AuditMiddleware`-style middleware
-//!    once a richer identity story is needed.
+//!    static list of pre-shared tokens. Richer identity schemes are outside
+//!    this bounded dispatch contract.
 //!
 //! 3. **DCC scope is enforced at the token level.** Every token may
 //!    declare an `allowed_dcc` set (e.g. `["maya", "blender"]`). On
 //!    `POST /v1/instances/register` the gateway compares the incoming
-//!    `dcc_type` against the token's set and rejects mismatches with a
-//!    structured `unauthorized` envelope.
+//!    `dcc_type` against the token's set. Protected backend dispatch uses the
+//!    resolved registry row rather than caller metadata for the same check.
 //!
 //! Out-of-scope for this module (tracked in #1367 follow-ups):
 //!
 //! * In-binary TLS termination — operators run the gateway behind a
 //!   reverse proxy that does TLS, mTLS, and rate limiting.
-//! * Per-call scope (`call`, `read_resources`, `admin`). Today we only
-//!   enforce `register` scope because that is the network boundary
-//!   `gateway://instances` exposes.
+//! * Native gateway mutators, direct per-DCC listeners, and principal-to-lease
+//!   or audit binding. Those require a wider ingress contract than this module.
 //!
 //! See `docs/guide/gateway.md` § Security and `tests/vrs/traces/core-1365
 //! -gateway-auth-negative.jsonl` for the operator-facing contract.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
+use dcc_mcp_models::DccName;
 use serde::{Deserialize, Serialize};
 
-/// A single pre-shared bearer token plus the DCC scope it is allowed to
-/// register.
+/// Borrowed credential presented at an HTTP ingress boundary.
 ///
-/// `allowed_dcc == None` means "this token can register any `dcc_type`",
+/// The raw header value is deliberately non-cloneable, non-serializable, and
+/// non-debuggable. It must be consumed immediately by
+/// [`GatewayAuth::authenticate_dispatch`] and must never enter tracing, audit
+/// metadata, or a backend request.
+pub(crate) struct PresentedAuthorization<'a> {
+    raw: Option<&'a str>,
+}
+
+impl<'a> PresentedAuthorization<'a> {
+    pub(crate) fn new(raw: Option<&'a str>) -> Self {
+        Self { raw }
+    }
+}
+
+/// Secret-free authentication context for one protected backend dispatch.
+///
+/// Fields are private so only this module can construct an authenticated
+/// grant. Caller-provided agent, session, lease, and correlation metadata are
+/// intentionally not authentication identity.
+pub(crate) struct DispatchRequestContext<'auth> {
+    authority: &'auth GatewayAuth,
+    authorization: DispatchAuthorization,
+}
+
+enum DispatchAuthorization {
+    AuthDisabled,
+    Authenticated { token_index: usize },
+}
+
+/// A single pre-shared bearer token plus its allowed registration and dispatch
+/// DCC scope.
+///
+/// `allowed_dcc == None` means "this token can use any `dcc_type`",
 /// useful for an operator that bootstraps a multi-DCC studio with a
 /// single master token. `allowed_dcc = Some(set)` confines the token to
 /// those DCC types and rejects anything else with a structured
 /// `dcc_scope_mismatch` envelope.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct GatewayAuthToken {
     /// Bearer secret. Never logged in `Debug` form — `Display` is not
     /// implemented on purpose. Operators are responsible for keeping the
@@ -54,10 +84,20 @@ pub struct GatewayAuthToken {
     /// Optional scope: `None` accepts any DCC, `Some(set)` confines the
     /// token to the listed DCC types (`"maya"`, `"blender"`, …).
     pub allowed_dcc: Option<BTreeSet<String>>,
-    /// Optional opaque label surfaced in audit log entries — not used
-    /// for matching. Defaults to the empty string.
+    /// Optional opaque operator label retained in configuration. It is not
+    /// used for matching or dispatch attribution. Defaults to the empty string.
     #[serde(default)]
     pub label: String,
+}
+
+impl fmt::Debug for GatewayAuthToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GatewayAuthToken")
+            .field("token", &"[REDACTED]")
+            .field("allowed_dcc", &self.allowed_dcc)
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 impl GatewayAuthToken {
@@ -111,6 +151,73 @@ impl GatewayAuth {
         !self.tokens.is_empty()
     }
 
+    /// Authenticate a presented credential exactly once at the ingress boundary.
+    ///
+    /// Invalid and missing credentials fail before backend discovery,
+    /// middleware, pending-call bookkeeping, or telemetry. The returned
+    /// context contains no raw credential and is bound to this exact auth
+    /// configuration instance.
+    pub(crate) fn authenticate_dispatch(
+        &self,
+        presented: PresentedAuthorization<'_>,
+    ) -> Result<DispatchRequestContext<'_>, AuthError> {
+        if !self.is_enabled() {
+            return Ok(DispatchRequestContext {
+                authority: self,
+                authorization: DispatchAuthorization::AuthDisabled,
+            });
+        }
+        let candidate = presented
+            .raw
+            .and_then(strip_bearer)
+            .ok_or(AuthError::CallUnauthorized)?;
+        let token_index = self
+            .tokens
+            .iter()
+            .position(|configured| {
+                constant_time_eq(configured.token.as_bytes(), candidate.as_bytes())
+            })
+            .ok_or(AuthError::CallUnauthorized)?;
+        Ok(DispatchRequestContext {
+            authority: self,
+            authorization: DispatchAuthorization::Authenticated { token_index },
+        })
+    }
+
+    /// Authorise one authenticated request for an authoritative resolved DCC.
+    ///
+    /// This second-stage check is owned by the current auth configuration. A
+    /// context issued by another configuration (including an auth-disabled
+    /// configuration) fails closed rather than acting as a self-contained
+    /// grant.
+    pub(crate) fn authorize_dispatch(
+        &self,
+        context: &DispatchRequestContext<'_>,
+        resolved_dcc_type: &DccName,
+    ) -> Result<(), AuthError> {
+        if !std::ptr::eq(self, context.authority) {
+            return Err(AuthError::CallUnauthorized);
+        }
+        match context.authorization {
+            DispatchAuthorization::AuthDisabled if !self.is_enabled() => Ok(()),
+            DispatchAuthorization::Authenticated { token_index } if self.is_enabled() => {
+                let token = self
+                    .tokens
+                    .get(token_index)
+                    .ok_or(AuthError::CallUnauthorized)?;
+                if token
+                    .allowed_dcc
+                    .as_ref()
+                    .is_some_and(|scope| !scope.contains(resolved_dcc_type.as_str()))
+                {
+                    return Err(AuthError::CallUnauthorized);
+                }
+                Ok(())
+            }
+            _ => Err(AuthError::CallUnauthorized),
+        }
+    }
+
     /// Authorise a `POST /v1/instances/register` request.
     ///
     /// * `authorization_header` — the raw `Authorization` header value as
@@ -161,6 +268,9 @@ pub enum AuthError {
     /// Token was recognised but the requested `dcc_type` is outside its
     /// `allowed_dcc` scope.
     DccScopeMismatch { presented_dcc: String },
+    /// A protected dispatch did not present an authorised credential. The
+    /// specific authentication or scope failure is hidden from callers.
+    CallUnauthorized,
 }
 
 impl AuthError {
@@ -171,6 +281,7 @@ impl AuthError {
                 "unauthorized"
             }
             AuthError::DccScopeMismatch { .. } => "dcc_scope_mismatch",
+            AuthError::CallUnauthorized => "unauthorized",
         }
     }
 
@@ -187,6 +298,9 @@ impl AuthError {
             AuthError::DccScopeMismatch { presented_dcc } => {
                 format!("Bearer token is not authorised to register dcc_type={presented_dcc}.")
             }
+            AuthError::CallUnauthorized => {
+                "Valid bearer authorization is required for this operation.".to_string()
+            }
         }
     }
 
@@ -195,6 +309,7 @@ impl AuthError {
         match self {
             AuthError::MissingBearer | AuthError::MalformedBearer | AuthError::UnknownToken => 401,
             AuthError::DccScopeMismatch { .. } => 403,
+            AuthError::CallUnauthorized => 401,
         }
     }
 }

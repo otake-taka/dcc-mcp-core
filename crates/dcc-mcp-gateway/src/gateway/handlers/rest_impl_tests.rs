@@ -1,4 +1,5 @@
 use super::*;
+use crate::gateway::security::PresentedAuthorization;
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use dcc_mcp_transport::discovery::file_registry::FileRegistry;
@@ -39,6 +40,15 @@ impl crate::gateway::middleware::BeforeCallMiddleware for ReplaceArgs {
 
 pub(super) fn test_gateway_state(server_version: &str) -> GatewayState {
     test_gateway_state_with_debug_routes(server_version, false)
+}
+
+pub(super) fn test_dispatch_ingress<'auth>(
+    gs: &'auth GatewayState,
+    headers: &HeaderMap,
+) -> DispatchIngress<'auth> {
+    DispatchIngress::authenticate(&gs.auth, headers.clone())
+        .ok()
+        .expect("test gateway auth is disabled")
 }
 
 fn test_gateway_state_with_debug_routes(
@@ -166,7 +176,7 @@ async fn response_text_with_headers(resp: Response) -> (StatusCode, HeaderMap, S
     (status, headers, String::from_utf8_lossy(&bytes).to_string())
 }
 
-fn trace_headers() -> HeaderMap {
+pub(super) fn trace_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("x-request-id", "req-rest-meta".parse().unwrap());
     headers.insert(
@@ -278,7 +288,7 @@ fn assert_body_metadata(body: &Value) {
     );
 }
 
-fn seed_unloaded_render_capability(gs: &GatewayState) {
+pub(super) fn seed_unloaded_render_capability(gs: &GatewayState) {
     gs.capability_index.set_unloaded_records(vec![
         crate::gateway::capability::CapabilityRecord::from_skill_tool(
             "maya-render",
@@ -1168,13 +1178,17 @@ async fn mcp_search_followups_correlate_describe_load_call_and_batch() {
     let gs = test_gateway_state("1.2.3");
     seed_unloaded_render_capability(&gs);
     let trace = crate::gateway::admin::trace::TraceContext::from_headers(&trace_headers());
-
+    let dispatch_context = gs
+        .auth
+        .authenticate_dispatch(PresentedAuthorization::new(None))
+        .unwrap();
     let search_args = json!({"query": "render"});
     let (search_text, search_is_error) = crate::gateway::aggregator::route_tools_call(
         &gs,
         "search",
         &search_args,
         None,
+        Some(&dispatch_context),
         Some("session-mcp"),
         Some(&trace),
         None,
@@ -1189,7 +1203,6 @@ async fn mcp_search_followups_correlate_describe_load_call_and_batch() {
         search["hits"][0]["next_step"]["arguments"]["meta"]["search_id"],
         search_id
     );
-
     let meta = json!({"search_id": search_id});
     let describe_args = json!({"tool_slug": slug.clone()});
     let (_describe_text, describe_is_error) = crate::gateway::aggregator::route_tools_call(
@@ -1197,39 +1210,39 @@ async fn mcp_search_followups_correlate_describe_load_call_and_batch() {
         "describe",
         &describe_args,
         Some(&meta),
+        Some(&dispatch_context),
         Some("session-mcp"),
         Some(&trace),
         None,
     )
     .await;
     assert!(describe_is_error);
-
     let load_args = json!({"skill_name": "maya-render", "dcc_type": "maya"});
     let (_load_text, load_is_error) = crate::gateway::aggregator::route_tools_call(
         &gs,
         "load_skill",
         &load_args,
         Some(&meta),
+        Some(&dispatch_context),
         Some("session-mcp"),
         Some(&trace),
         None,
     )
     .await;
     assert!(load_is_error);
-
     let call_args = json!({"tool_slug": slug.clone(), "arguments": {}});
     let (_call_text, call_is_error) = crate::gateway::aggregator::route_tools_call(
         &gs,
         "call",
         &call_args,
         Some(&meta),
+        Some(&dispatch_context),
         Some("session-mcp"),
         Some(&trace),
         None,
     )
     .await;
     assert!(call_is_error);
-
     let batch_args =
         json!({"calls": [{"id": "batch-1", "tool_slug": slug, "arguments": {}, "meta": meta}]});
     let (_batch_text, batch_is_error) = crate::gateway::aggregator::route_tools_call(
@@ -1237,13 +1250,13 @@ async fn mcp_search_followups_correlate_describe_load_call_and_batch() {
         "call",
         &batch_args,
         None,
+        Some(&dispatch_context),
         Some("session-mcp"),
         Some(&trace),
         None,
     )
     .await;
     assert!(batch_is_error);
-
     let telemetry = gs.search_telemetry.snapshot(10);
     assert_eq!(telemetry.stats.total_searches, 1);
     assert_eq!(telemetry.stats.describe_after_search_rate, 1.0);
@@ -1516,10 +1529,11 @@ async fn rest_trace_input_payload_uses_redacted_arguments() {
         axum::http::header::ACCEPT,
         "application/toon".parse().unwrap(),
     );
+    let ingress = test_dispatch_ingress(&gs, &headers);
 
     let result = call_service_with_admin_trace(
         &gs,
-        &headers,
+        &ingress,
         RestCallTraceRequest {
             method: "v1/call",
             slug: "maya.abcdef01.render",
@@ -1570,10 +1584,11 @@ async fn rest_traceparent_does_not_replace_request_id() {
         "meta": {},
         "response_format": "json"
     });
+    let ingress = test_dispatch_ingress(&gs, &headers);
 
     let _ = call_service_with_admin_trace(
         &gs,
-        &headers,
+        &ingress,
         RestCallTraceRequest {
             method: "v1/call",
             slug: "maya.abcdef01.render",
@@ -1639,10 +1654,11 @@ async fn rest_audit_rows_include_server_network_attribution() {
         "meta": {"agent_context": {"agent_id": "agent-1"}},
         "response_format": "json"
     });
+    let ingress = test_dispatch_ingress(&gs, &headers);
 
     let _ = call_service_with_admin_trace(
         &gs,
-        &headers,
+        &ingress,
         RestCallTraceRequest {
             method: "v1/call",
             slug: "maya.abcdef01.render",
@@ -1683,9 +1699,10 @@ async fn rest_call_batch_uses_arguments_mutated_by_before_middleware() {
     gs.middleware_chain = Arc::new(chain);
 
     let headers = HeaderMap::new();
+    let ingress = test_dispatch_ingress(&gs, &headers);
     let result = call_batch_with_admin_trace(
         &gs,
-        &headers,
+        &ingress,
         &json!({"calls": []}),
         crate::gateway::admin::trace::TraceContext::from_headers(&headers),
     )
@@ -1831,12 +1848,16 @@ async fn mcp_search_and_call_apply_gateway_policy() {
     });
     let (maya_read, custom_read, maya_write, custom_write) =
         seed_policy_unloaded_records(&search_gs);
-
+    let search_dispatch_context = search_gs
+        .auth
+        .authenticate_dispatch(PresentedAuthorization::new(None))
+        .unwrap();
     let (search_text, search_is_error) = crate::gateway::aggregator::route_tools_call(
         &search_gs,
         "search",
         &json!({}),
         None,
+        Some(&search_dispatch_context),
         None,
         None,
         None,
@@ -1854,18 +1875,22 @@ async fn mcp_search_and_call_apply_gateway_policy() {
     assert!(slugs.contains(&custom_read.as_str()));
     assert!(!slugs.contains(&maya_write.as_str()));
     assert!(!slugs.contains(&custom_write.as_str()));
-
     let mut call_gs = test_gateway_state("1.2.3");
     call_gs.policy = Arc::new(crate::gateway::GatewayPolicy {
         read_only: true,
         ..policy_for_safe_reads()
     });
     let (_, _, maya_write, _) = seed_policy_records(&call_gs).await;
+    let call_dispatch_context = call_gs
+        .auth
+        .authenticate_dispatch(PresentedAuthorization::new(None))
+        .unwrap();
     let (call_text, call_is_error) = crate::gateway::aggregator::route_tools_call(
         &call_gs,
         "call",
         &json!({"tool_slug": maya_write, "arguments": {}}),
         None,
+        Some(&call_dispatch_context),
         None,
         None,
         None,
@@ -1875,121 +1900,4 @@ async fn mcp_search_and_call_apply_gateway_policy() {
     let call_body: Value = serde_json::from_str(&call_text).unwrap();
     assert_eq!(call_body["error"]["kind"], "policy-denied");
     assert_eq!(call_body["error"]["policy"]["reason"], "skill-allowlist");
-}
-
-#[tokio::test]
-async fn gateway_rest_v1_call_rejects_missing_tool_slug_and_calls() {
-    let gs = test_gateway_state("1.2.3");
-    let (status, body) = response_json(
-        handle_v1_call(State(gs), HeaderMap::new(), Json(json!({"arguments": {}}))).await,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["kind"], "bad-request");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("tool_slug or calls")),
-        "expected message mentioning tool_slug or calls, got {:?}",
-        body["error"]["message"]
-    );
-}
-
-#[tokio::test]
-async fn gateway_rest_v1_call_batch_via_calls_dispatches_batch_response() {
-    let gs = test_gateway_state("1.2.3");
-    // Seeded capability — backend won't be reachable but batch dispatch
-    // is validated through the response envelope shape.
-    seed_unloaded_render_capability(&gs);
-    let slug = "maya.00000000-0000-0000-0000-000000000000.render";
-
-    let (status, body) = response_json(
-        handle_v1_call(
-            State(gs),
-            trace_headers(),
-            Json(json!({
-                "calls": [
-                    {"id": "step-1", "tool_slug": slug, "arguments": {"radius": 3.0}},
-                    {"id": "step-2", "tool_slug": "missing.slug", "arguments": {}}
-                ],
-                "stop_on_error": false
-            })),
-        )
-        .await,
-    )
-    .await;
-    // Batch dispatch succeeds at the gateway level — individual items may
-    // fail because no backend is live, but the response envelope is the
-    // batch shape.
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        body.get("success").is_some(),
-        "batch response should have 'success'"
-    );
-    assert!(
-        body.get("results").is_some(),
-        "batch response should have 'results'"
-    );
-    assert!(
-        body["results"].as_array().is_some_and(|r| r.len() == 2),
-        "expected 2 results, got {:?}",
-        body["results"]
-    );
-    // stop_on_error echoed back
-    assert_eq!(body["stop_on_error"], false);
-    // First result item carries the client id
-    assert_eq!(body["results"][0]["id"], "step-1");
-    assert_eq!(body["results"][1]["id"], "step-2");
-    // Items report index
-    assert_eq!(body["results"][0]["index"], 0);
-    assert_eq!(body["results"][1]["index"], 1);
-}
-
-#[tokio::test]
-async fn gateway_rest_v1_call_single_tool_slug_accepts_params_alias() {
-    use crate::gateway::middleware::{AuditMiddleware, MiddlewareChain};
-
-    let sink = Arc::new(CaptureSink::default());
-    let mut gs = test_gateway_state("1.2.3");
-    gs.middleware_chain =
-        Arc::new(MiddlewareChain::new().with_after(Arc::new(AuditMiddleware::new(sink.clone()))));
-    // Without a live backend single-call reports the prior owner as gone,
-    // but the dispatch path must still be exercised (backward compat).
-    seed_unloaded_render_capability(&gs);
-    let slug = "maya.00000000-0000-0000-0000-000000000000.render";
-
-    let (status, body) = response_json(
-        handle_v1_call(
-            State(gs),
-            HeaderMap::new(),
-            Json(json!({"tool_slug": slug, "params": {"radius": 3.0}})),
-        )
-        .await,
-    )
-    .await;
-    // The indexed owner no longer exists → 410 GONE (not a retryable 503).
-    assert_eq!(status, StatusCode::GONE);
-    assert_eq!(body["error"]["previous_status"], "exited");
-    assert_eq!(body["error"]["retryable"], false);
-    assert!(body["error"]["recommended_next_action"].is_string());
-    // Error envelope is the single-call shape, not the batch envelope.
-    assert!(
-        body.get("error").is_some(),
-        "single-call error should have 'error', got {:?}",
-        body
-    );
-    assert!(
-        body.get("success").is_none(),
-        "single-call error should NOT have batch 'success' field"
-    );
-    let entries = sink.0.lock().unwrap();
-    let input: Value = serde_json::from_str(
-        &entries[0]
-            .input_payload
-            .as_ref()
-            .expect("REST audit should capture call arguments")
-            .content,
-    )
-    .unwrap();
-    assert_eq!(input["radius"], 3.0);
 }

@@ -399,6 +399,7 @@ pub(super) fn service_error_status(err: &ServiceError) -> StatusCode {
             _ => StatusCode::SERVICE_UNAVAILABLE,
         },
         "policy-denied" => StatusCode::FORBIDDEN,
+        "unauthorized" => StatusCode::UNAUTHORIZED,
         "throttled" => StatusCode::TOO_MANY_REQUESTS,
         "host-busy" => StatusCode::SERVICE_UNAVAILABLE,
         "host-died" => StatusCode::BAD_GATEWAY,
@@ -422,6 +423,29 @@ pub(super) fn service_error_response_with_metadata(
         None,
         metadata,
         include_body_metadata,
+    )
+}
+
+pub(super) fn dispatch_auth_error_response(
+    headers: &HeaderMap,
+    body: &Value,
+    error: &crate::gateway::security::AuthError,
+    batch: bool,
+) -> Response {
+    let service_error = ServiceError::new(error.kind(), error.message());
+    let metadata = RestResponseMetadata::from_headers(headers);
+    let mut payload = service_error_to_json(&service_error);
+    if batch && let Some(object) = payload.as_object_mut() {
+        object.insert("success".to_string(), json!(false));
+    }
+    negotiated_response_with_metadata(
+        headers,
+        body,
+        StatusCode::UNAUTHORIZED,
+        payload,
+        None,
+        &metadata,
+        batch,
     )
 }
 
