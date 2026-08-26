@@ -281,17 +281,16 @@ pub(crate) fn build_gateway_openapi_document(server_version: &str) -> Value {
             gateway_response_ref("DescribeResponse"),
         ),
     );
-    paths.insert(
-        "/v1/call".to_string(),
-        post_operation_with_params(
-            &["tools"],
-            "Call a gateway capability",
-            "Invokes one gateway capability by tool_slug, or up to 25 capabilities in order via calls[] with optional stop_on_error semantics. When calls is present the response shape follows the batch result envelope; single-call responses are returned unwrapped.",
-            vec![accept_response_format_header()],
-            request_body_ref("CallRequest"),
-            gateway_response_ref("CallOutcome"),
-        ),
+    let mut call_operation = post_operation_with_params(
+        &["tools"],
+        "Call a gateway capability",
+        "Invokes one gateway capability by tool_slug, or up to 25 capabilities in order via calls[] with optional stop_on_error semantics. When calls is present the response shape follows the batch result envelope; single-call responses are returned unwrapped.",
+        vec![accept_response_format_header()],
+        request_body_ref("CallRequest"),
+        gateway_response_ref("CallOutcome"),
     );
+    call_operation["post"]["responses"]["202"] = gateway_response_ref("CallOutcome");
+    paths.insert("/v1/call".to_string(), call_operation);
     paths.insert(
         "/v1/call_batch".to_string(),
         post_operation_with_params(
@@ -330,23 +329,26 @@ pub(crate) fn build_gateway_openapi_document(server_version: &str) -> Value {
             gateway_response_ref("DescribeResponse"),
         ),
     );
+    let mut instance_call_operation = post_operation_with_params(
+        &["tools"],
+        "Call an instance-scoped backend tool",
+        "Calls a backend tool by DCC type and instance id or unique id prefix.",
+        vec![
+            path_param("dcc_type", "DCC type, for example maya or blender."),
+            path_param(
+                "instance_id",
+                "Full instance UUID, instance_short, or unique UUID prefix.",
+            ),
+            accept_response_format_header(),
+        ],
+        request_body_ref("GatewayDirectCallRequest"),
+        gateway_response_ref("CallOutcome"),
+    );
+    instance_call_operation["post"]["responses"]["202"] =
+        gateway_response_ref("CallOutcome");
     paths.insert(
         "/v1/dcc/{dcc_type}/instances/{instance_id}/call".to_string(),
-        post_operation_with_params(
-            &["tools"],
-            "Call an instance-scoped backend tool",
-            "Calls a backend tool by DCC type and instance id or unique id prefix.",
-            vec![
-                path_param("dcc_type", "DCC type, for example maya or blender."),
-                path_param(
-                    "instance_id",
-                    "Full instance UUID, instance_short, or unique UUID prefix.",
-                ),
-                accept_response_format_header(),
-            ],
-            request_body_ref("GatewayDirectCallRequest"),
-            gateway_response_ref("CallOutcome"),
-        ),
+        instance_call_operation,
     );
     paths.insert(
         "/v1/dcc/{dcc_type}/instances/{instance_id}/stop".to_string(),

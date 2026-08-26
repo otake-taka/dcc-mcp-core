@@ -1176,7 +1176,7 @@ pub async fn handle_v1_call(
             negotiated_response_with_metadata(
                 &headers,
                 &body,
-                StatusCode::OK,
+                successful_call_http_status(&result),
                 result,
                 None,
                 &metadata,
@@ -1291,7 +1291,7 @@ pub async fn handle_v1_dcc_instance_call(
         Ok(result) => negotiated_response_with_metadata(
             &headers,
             &body,
-            StatusCode::OK,
+            successful_call_http_status(&result),
             result,
             None,
             &metadata,
