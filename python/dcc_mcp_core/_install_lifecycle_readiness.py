@@ -2,8 +2,10 @@
 
 # ruff: noqa: UP006, UP045
 
+# Import future modules
 from __future__ import annotations
 
+# Import built-in modules
 import time
 from typing import Any
 from typing import Dict
@@ -20,6 +22,8 @@ DISPATCH_STATUS_UNAVAILABLE = "unavailable"
 DISPATCH_STATUS_AMBIGUOUS = "ambiguous"
 RETRYABLE_HOST_RPC_SCHEMES = {"commandport", "qtserver", "ws", "wss"}
 RETRYABLE_FAILURE_STAGES = {"host-rpc-connect"}
+_PROBE_RESPONSE_MAX_BYTES = 1024 * 1024
+_PROBE_TRANSPORT_DESYNC = object()
 
 
 def sidecar_readiness_status(
@@ -83,6 +87,7 @@ def sidecar_readiness_status(
             probe_timeout_secs=probe_timeout_secs,
         )
         if probe and not probe.get("success"):
+            transport_desync = probe.get("status") == "probe_transport_desync"
             return {
                 "success": False,
                 "status": probe.get("status", "probe_failed"),
@@ -91,10 +96,18 @@ def sidecar_readiness_status(
                 "entry": ready[0],
                 "entries": entries,
                 "probe": probe,
-                "message": "Sidecar dispatch metadata is ready, but the probe tool failed.",
+                "message": (
+                    "Sidecar dispatch metadata is ready, but the probe transport desynchronized."
+                    if transport_desync
+                    else "Sidecar dispatch metadata is ready, but the probe tool failed."
+                ),
                 "recommended_next_action": (
-                    "Fix the adapter dispatcher, loaded skills, or probe tool configuration, "
-                    "then check readiness again."
+                    "Restart the sidecar or fix request-id correlation before checking readiness again."
+                    if transport_desync
+                    else (
+                        "Fix the adapter dispatcher, loaded skills, or probe tool configuration, "
+                        "then check readiness again."
+                    )
                 ),
             }
         return {
@@ -225,7 +238,7 @@ def probe_sidecar_tool(
     *,
     timeout_secs: float = 3.0,
 ) -> Dict[str, Any]:
-    """Call one sidecar ``tools/call`` probe without importing native core."""
+    """Dispatch one ``tools/call`` readiness probe; this is not a general MCP client."""
     url = str(mcp_url or "").strip()
     name = str(tool_name or "").strip()
     if not url:
@@ -248,7 +261,7 @@ def probe_sidecar_tool(
         data=body,
         headers={
             "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/json, text/event-stream",
         },
         method="POST",
     )
@@ -256,10 +269,27 @@ def probe_sidecar_tool(
     try:
         with urllib.request.urlopen(request, timeout=max(0.1, float(timeout_secs))) as response:
             status_code = int(getattr(response, "status", 200))
-            response_body = response.read().decode("utf-8", errors="replace")
+            content_length = _probe_content_length(response)
+            response_body = _read_probe_response(response)
+            if response_body is None:
+                return _probe_response_too_large(url, name, request_id, status_code)
+            if content_length is not None and len(response_body) != content_length:
+                return _probe_bad_response(url, name, request_id, status_code)
+            parsed = _parse_probe_response(response, response_body, request_id)
+            if parsed is _PROBE_TRANSPORT_DESYNC:
+                return _probe_transport_desync(url, name, request_id, status_code)
     except urllib.error.HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace")
-        parsed = _json_loads(response_body)
+        content_length = _probe_content_length(exc)
+        response_body = _read_probe_response(exc)
+        if response_body is None:
+            return _probe_response_too_large(url, name, request_id, exc.code)
+        if content_length is not None and len(response_body) != content_length:
+            return _probe_bad_response(url, name, request_id, exc.code)
+        parsed = _parse_probe_response(exc, response_body, request_id)
+        if parsed is _PROBE_TRANSPORT_DESYNC:
+            return _probe_transport_desync(url, name, request_id, exc.code)
+        if not isinstance(parsed, dict):
+            return _probe_bad_response(url, name, request_id, exc.code)
         return _probe_result(
             False,
             "probe_http_error",
@@ -281,20 +311,11 @@ def probe_sidecar_tool(
             error=str(exc),
         )
 
-    parsed = _json_loads(response_body)
     if not isinstance(parsed, dict):
-        return _probe_result(
-            False,
-            "probe_bad_response",
-            "Probe tool returned a non-JSON-RPC response.",
-            mcp_url=url,
-            tool_name=name,
-            request_id=request_id,
-            http_status=status_code,
-            response=parsed,
-        )
-    if parsed.get("error"):
-        error = parsed.get("error") if isinstance(parsed.get("error"), dict) else {"message": parsed.get("error")}
+        return _probe_bad_response(url, name, request_id, status_code)
+    if "error" in parsed:
+        raw_error = parsed["error"]
+        error: Dict[str, Any] = raw_error if isinstance(raw_error, dict) else {"message": raw_error}
         return _probe_result(
             False,
             "probe_failed",
@@ -305,8 +326,8 @@ def probe_sidecar_tool(
             http_status=status_code,
             error=error,
         )
-    result = parsed.get("result")
-    if isinstance(result, dict) and result.get("success") is False:
+    result: Dict[str, Any] = parsed["result"]
+    if result.get("success") is False:
         return _probe_result(
             False,
             "probe_failed",
@@ -317,7 +338,7 @@ def probe_sidecar_tool(
             http_status=status_code,
             result=result,
         )
-    if isinstance(result, dict) and result.get("isError") is True:
+    if result.get("isError") is True:
         return _probe_result(
             False,
             "probe_failed",
@@ -337,6 +358,91 @@ def probe_sidecar_tool(
         request_id=request_id,
         http_status=status_code,
         result=result,
+    )
+
+
+def _read_probe_response(response: Any) -> Optional[bytes]:
+    body = response.read(_PROBE_RESPONSE_MAX_BYTES + 1)
+    if len(body) > _PROBE_RESPONSE_MAX_BYTES:
+        return None
+    return body
+
+
+def _probe_content_length(response: Any) -> Optional[int]:
+    raw_value = getattr(response, "headers", {}).get("Content-Length")
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _parse_probe_response(response: Any, body: bytes, request_id: str) -> Any:
+    content_type = str(getattr(response, "headers", {}).get("Content-Type", ""))
+    if content_type.split(";", 1)[0].strip().lower() != "application/json":
+        return None
+    try:
+        decoded = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    parsed = _json_loads(decoded)
+    if not isinstance(parsed, dict):
+        return None
+    if parsed.get("jsonrpc") != "2.0":
+        return None
+    if parsed.get("id") != request_id:
+        return _PROBE_TRANSPORT_DESYNC
+    has_result = "result" in parsed
+    has_error = "error" in parsed
+    if has_result == has_error:
+        return None
+    if has_result and not isinstance(parsed["result"], dict):
+        return None
+    if has_error and not isinstance(parsed["error"], dict):
+        return None
+    if has_error:
+        error = parsed["error"]
+        code = error.get("code")
+        if not isinstance(code, int) or isinstance(code, bool) or not isinstance(error.get("message"), str):
+            return None
+    return parsed
+
+
+def _probe_response_too_large(url: str, name: str, request_id: str, status_code: int) -> Dict[str, Any]:
+    return _probe_result(
+        False,
+        "probe_response_too_large",
+        "Probe tool response exceeded the 1 MiB limit.",
+        mcp_url=url,
+        tool_name=name,
+        request_id=request_id,
+        http_status=status_code,
+    )
+
+
+def _probe_bad_response(url: str, name: str, request_id: str, status_code: int) -> Dict[str, Any]:
+    return _probe_result(
+        False,
+        "probe_bad_response",
+        "Probe tool returned a non-JSON-RPC response.",
+        mcp_url=url,
+        tool_name=name,
+        request_id=request_id,
+        http_status=status_code,
+    )
+
+
+def _probe_transport_desync(url: str, name: str, request_id: str, status_code: int) -> Dict[str, Any]:
+    return _probe_result(
+        False,
+        "probe_transport_desync",
+        "Probe tool response did not echo the request id; transport desync.",
+        mcp_url=url,
+        tool_name=name,
+        request_id=request_id,
+        http_status=status_code,
     )
 
 
