@@ -3,8 +3,9 @@ use super::*;
 use axum::http::HeaderMap;
 use dcc_mcp_transport::discovery::file_registry::FileRegistry;
 use dcc_mcp_transport::discovery::types::ServiceEntry;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct FakeCallBackend {
     state: GatewayState,
@@ -97,7 +98,7 @@ async fn fake_call_backend() -> FakeCallBackend {
     let traffic_sink = traffic.clone();
     let _subscription = state
         .traffic_capture
-        .subscribe_redacted_frames(move |frame| traffic_sink.lock().unwrap().push(frame.clone()));
+        .subscribe_redacted_frames(move |frame| traffic_sink.lock().push(frame.clone()));
 
     FakeCallBackend {
         state,
@@ -179,7 +180,7 @@ async fn gateway_call_routes_preserve_native_pending_status_and_traces() {
     .await;
     assert_eq!(invalid_pending_status, StatusCode::OK);
 
-    let traffic = backend.traffic.lock().unwrap();
+    let traffic = backend.traffic.lock();
     for (request_id, expected) in [
         ("req-canonical-pending", 202),
         ("req-instance-pending", 202),
