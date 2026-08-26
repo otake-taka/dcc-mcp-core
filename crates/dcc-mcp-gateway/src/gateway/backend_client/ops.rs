@@ -14,7 +14,7 @@ use crate::gateway::resilience::{
 use super::error::{BackendCallError, rest_error_prometheus_kind};
 use super::http::{
     percent_encode_uri, post_jsonrpc, post_jsonrpc_with_trace_context, rest_get, rest_post,
-    rest_post_with_trace_context, uuid_like_id,
+    rest_post_response_with_trace_context, uuid_like_id,
 };
 use super::probe::{ProbeOutcome, probe_mcp_readiness};
 use super::urls::rest_base_from_mcp_url;
@@ -792,7 +792,7 @@ pub async fn forward_tools_call(
     let expected_request_id = request_id
         .as_deref()
         .or_else(|| trace_context.map(|ctx| ctx.request_id.as_str()));
-    match rest_post_with_trace_context(
+    match rest_post_response_with_trace_context(
         client,
         &url,
         body,
@@ -802,7 +802,7 @@ pub async fn forward_tools_call(
     )
     .await
     {
-        Ok(v) => {
+        Ok(response) => {
             resilience.circuits().on_success(key);
             if let Some(capture) = traffic_capture {
                 emit_backend_traffic_frame(
@@ -811,11 +811,11 @@ pub async fn forward_tools_call(
                     &url,
                     "response",
                     "adapter_to_gateway",
-                    Some(200),
-                    v.clone(),
+                    Some(response.status.as_u16()),
+                    response.body.clone(),
                 );
             }
-            Ok(v)
+            Ok(response.body)
         }
         Err(e) => {
             if is_circuit_worthy_rest_error(&e) {

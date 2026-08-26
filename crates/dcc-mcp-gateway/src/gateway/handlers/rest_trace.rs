@@ -46,6 +46,19 @@ fn redact_inline_image_data(value: &mut Value) {
     }
 }
 
+pub(super) fn successful_call_http_status(value: &Value) -> StatusCode {
+    let is_pending = value.pointer("/output/status").and_then(Value::as_str) == Some("pending");
+    let has_job_id = value
+        .pointer("/output/job_id")
+        .and_then(Value::as_str)
+        .is_some_and(|job_id| !job_id.trim().is_empty());
+    if is_pending && has_job_id {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    }
+}
+
 pub(super) struct RestCallTraceRequest<'a> {
     pub(super) method: &'a str,
     pub(super) slug: &'a str,
@@ -281,7 +294,11 @@ pub(super) async fn call_service_with_admin_trace(
             path: method,
             direction: "outbound",
             leg: "gateway_to_client",
-            status: Some(if transport_error { 502 } else { 200 }),
+            status: Some(if transport_error {
+                502
+            } else {
+                successful_call_http_status(&output_value).as_u16()
+            }),
             body: observed_output,
         },
     );

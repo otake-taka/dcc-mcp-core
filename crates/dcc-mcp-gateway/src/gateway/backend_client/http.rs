@@ -79,6 +79,25 @@ pub(super) async fn rest_post_with_trace_context(
     request_id: Option<&str>,
     trace_context: Option<&TraceContext>,
 ) -> Result<Value, String> {
+    rest_post_response_with_trace_context(client, url, body, timeout, request_id, trace_context)
+        .await
+        .map(|response| response.body)
+}
+
+pub(super) struct RestPostResponse {
+    pub(super) status: reqwest::StatusCode,
+    pub(super) body: Value,
+}
+
+/// Issue a `POST` while preserving the backend's successful HTTP status.
+pub(super) async fn rest_post_response_with_trace_context(
+    client: &reqwest::Client,
+    url: &str,
+    body: Value,
+    timeout: Duration,
+    request_id: Option<&str>,
+    trace_context: Option<&TraceContext>,
+) -> Result<RestPostResponse, String> {
     let mut request = client
         .post(url)
         .timeout(timeout)
@@ -134,7 +153,10 @@ pub(super) async fn rest_post_with_trace_context(
     if !status.is_success() {
         return Err(format!("{url}: HTTP {status}: {body}"));
     }
-    Ok(response)
+    Ok(RestPostResponse {
+        status,
+        body: response,
+    })
 }
 
 pub(super) async fn post_jsonrpc(

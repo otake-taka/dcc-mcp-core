@@ -1176,7 +1176,7 @@ pub async fn handle_v1_call(
             negotiated_response_with_metadata(
                 &headers,
                 &body,
-                StatusCode::OK,
+                successful_call_http_status(&result),
                 result,
                 None,
                 &metadata,
@@ -1291,7 +1291,7 @@ pub async fn handle_v1_dcc_instance_call(
         Ok(result) => negotiated_response_with_metadata(
             &headers,
             &body,
-            StatusCode::OK,
+            successful_call_http_status(&result),
             result,
             None,
             &metadata,
@@ -1395,3 +1395,7 @@ mod rest_impl_batch_tests;
 #[cfg(test)]
 #[path = "rest_impl_safety_tests.rs"]
 mod rest_impl_safety_tests;
+
+#[cfg(test)]
+#[path = "rest_impl_native_status_tests.rs"]
+mod rest_impl_native_status_tests;
