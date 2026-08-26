@@ -37,6 +37,7 @@ class McpHttpConfig:
     enable_prometheus: bool = False
     gateway_port: int = 9765
     registry_dir: str | None = None
+    adapter_version: str | None = None
     dcc_version: str = ""
     scene: str = ""
     dcc_type: str = ""
@@ -67,6 +68,8 @@ class McpHttpConfig:
         self.enable_prometheus = bool(kwargs.pop("enable_prometheus", False))
         self.gateway_port = int(kwargs.pop("gateway_port", 9765))
         self.registry_dir = kwargs.pop("registry_dir", None)
+        raw_adapter_version = kwargs.pop("adapter_version", None)
+        self.adapter_version = str(raw_adapter_version) if raw_adapter_version is not None else None
         self.dcc_version = str(kwargs.pop("dcc_version", ""))
         self.scene = str(kwargs.pop("scene", ""))
         self.dcc_type = str(kwargs.pop("dcc_type", ""))

@@ -74,6 +74,10 @@ class TestPureMcpHttpConfig:
         assert "1234" in text
         assert "maya-mcp" in text
 
+    def test_adapter_version_is_optional(self):
+        assert PureMcpHttpConfig().adapter_version is None
+        assert PureMcpHttpConfig(adapter_version="1.2.3").adapter_version == "1.2.3"
+
 
 class TestServerFactoryRouting:
     def test_uses_sidecar_backend_when_core_unavailable(self, monkeypatch: pytest.MonkeyPatch):
