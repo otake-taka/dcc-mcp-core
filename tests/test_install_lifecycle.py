@@ -1,7 +1,9 @@
 """Tests for import-light adapter install lifecycle helpers."""
 
+# Import future modules
 from __future__ import annotations
 
+# Import built-in modules
 import errno
 from http.server import BaseHTTPRequestHandler
 from http.server import HTTPServer
@@ -12,9 +14,12 @@ import subprocess
 import sys
 import threading
 import types
+from typing import Optional
 
+# Import third-party modules
 import pytest
 
+# Import local modules
 import dcc_mcp_core._install_lifecycle_readiness as readiness_lifecycle
 import dcc_mcp_core._install_lifecycle_runtime as runtime_lifecycle
 import dcc_mcp_core._install_lifecycle_sidecar as sidecar_lifecycle
@@ -28,17 +33,28 @@ def test_install_lifecycle_library_does_not_own_cli_parser() -> None:
     assert not hasattr(lifecycle, "main")
 
 
-def _start_probe_server(response_payload: dict) -> tuple[HTTPServer, str, list[dict]]:
+def _start_probe_server(
+    response_payload: object,
+    *,
+    status_code: int = 200,
+    content_type: str = "application/json",
+    response_body: Optional[bytes] = None,  # noqa: UP045  # Python 3.7 test-suite syntax compatibility
+    content_length_delta: int = 0,
+) -> tuple[HTTPServer, str, list[dict], list[dict[str, str]]]:
     requests: list[dict] = []
+    headers: list[dict[str, str]] = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             length = int(self.headers.get("content-length", "0"))
-            requests.append(json.loads(self.rfile.read(length).decode("utf-8")))
-            body = json.dumps(response_payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(body)))
+            request = json.loads(self.rfile.read(length).decode("utf-8"))
+            requests.append(request)
+            headers.append({key.lower(): value for key, value in self.headers.items()})
+            payload = response_payload(request) if callable(response_payload) else response_payload
+            body = response_body if response_body is not None else json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("content-type", content_type)
+            self.send_header("content-length", str(len(body) + content_length_delta))
             self.end_headers()
             self.wfile.write(body)
 
@@ -49,7 +65,7 @@ def _start_probe_server(response_payload: dict) -> tuple[HTTPServer, str, list[d
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     url = f"http://127.0.0.1:{server.server_port}/mcp"
-    return server, url, requests
+    return server, url, requests, headers
 
 
 def _write_ready_sidecar_registry(tmp_path: Path) -> Path:
@@ -550,8 +566,10 @@ def test_sidecar_readiness_status_reports_ambiguous_instance_prefix(tmp_path: Pa
     assert exact["entry"]["instance_id"] == first_instance
 
 
-def test_probe_sidecar_tool_posts_jsonrpc_tools_call() -> None:
-    server, url, requests = _start_probe_server({"jsonrpc": "2.0", "id": "ignored", "result": {"success": True}})
+def test_probe_sidecar_tool_posts_correlated_jsonrpc_tools_call() -> None:
+    server, url, requests, headers = _start_probe_server(
+        lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": {"success": True}}
+    )
     try:
         result = lifecycle.probe_sidecar_tool(
             url,
@@ -571,13 +589,15 @@ def test_probe_sidecar_tool_posts_jsonrpc_tools_call() -> None:
         "name": "maya_diagnostics__ping",
         "arguments": {"level": "quick"},
     }
+    assert headers[0]["content-type"] == "application/json"
+    assert headers[0]["accept"] == "application/json, text/event-stream"
 
 
 def test_probe_sidecar_tool_reports_jsonrpc_error() -> None:
-    server, url, _requests = _start_probe_server(
-        {
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {
             "jsonrpc": "2.0",
-            "id": "ignored",
+            "id": request["id"],
             "error": {
                 "code": -32000,
                 "message": "sidecar-dispatcher-unavailable",
@@ -597,10 +617,10 @@ def test_probe_sidecar_tool_reports_jsonrpc_error() -> None:
 
 
 def test_probe_sidecar_tool_reports_mcp_error_result() -> None:
-    server, url, _requests = _start_probe_server(
-        {
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {
             "jsonrpc": "2.0",
-            "id": "ignored",
+            "id": request["id"],
             "result": {
                 "isError": True,
                 "content": [{"type": "text", "text": "dispatcher unavailable"}],
@@ -616,6 +636,224 @@ def test_probe_sidecar_tool_reports_mcp_error_result() -> None:
     assert result["success"] is False
     assert result["status"] == "probe_failed"
     assert result["result"]["isError"] is True
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "expected_status"),
+    [
+        (lambda _request: {"jsonrpc": "2.0", "id": "wrong", "result": {}}, "probe_transport_desync"),
+        (lambda _request: {"jsonrpc": "2.0", "result": {}}, "probe_transport_desync"),
+        (
+            lambda request: {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {},
+                "error": {"message": "also wrong"},
+            },
+            "probe_bad_response",
+        ),
+        (lambda request: {"jsonrpc": "2.0", "id": request["id"]}, "probe_bad_response"),
+        (lambda request: {"id": request["id"], "result": {}}, "probe_bad_response"),
+        (lambda request: {"jsonrpc": "1.0", "id": request["id"], "result": {}}, "probe_bad_response"),
+        (lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": []}, "probe_bad_response"),
+        (lambda request: {"jsonrpc": "2.0", "id": request["id"], "error": "not an object"}, "probe_bad_response"),
+        (lambda request: {"jsonrpc": "2.0", "id": request["id"], "error": {}}, "probe_bad_response"),
+        (
+            lambda request: {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": "-32000", "message": "wrong code type"},
+            },
+            "probe_bad_response",
+        ),
+        (
+            lambda request: {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": -32000, "message": ["wrong message type"]},
+            },
+            "probe_bad_response",
+        ),
+    ],
+    ids=[
+        "mismatched-id",
+        "missing-id",
+        "both-result-and-error",
+        "missing-result-and-error",
+        "missing-jsonrpc",
+        "wrong-jsonrpc",
+        "non-object-result",
+        "non-object-error",
+        "empty-error",
+        "non-integer-error-code",
+        "non-string-error-message",
+    ],
+)
+def test_probe_sidecar_tool_rejects_uncorrelated_or_ambiguous_jsonrpc_response(
+    response_payload: object, expected_status: str
+) -> None:
+    server, url, _requests, _headers = _start_probe_server(response_payload)
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "houdini_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == expected_status
+    assert "response" not in result
+
+
+def test_probe_sidecar_tool_rejects_non_utf8_json_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(readiness_lifecycle.uuid, "uuid4", lambda: types.SimpleNamespace(hex="fixed"))
+    server, url, _requests, _headers = _start_probe_server(
+        {},
+        response_body=(
+            b'{"jsonrpc":"2.0","id":"sidecar-ready-probe-fixed","result":{"detail":"' + bytes([0xFF]) + b'"}}'
+        ),
+    )
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "unreal_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_bad_response"
+
+
+def test_probe_sidecar_tool_preserves_success_false_result_as_probe_failure() -> None:
+    expected_result = {"success": False, "message": "dispatcher unavailable"}
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": expected_result}
+    )
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "maya_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_failed"
+    assert result["message"] == "dispatcher unavailable"
+    assert result["result"] == expected_result
+
+
+def test_probe_sidecar_tool_preserves_bounded_correlated_http_jsonrpc_error() -> None:
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "error": {"code": -32000, "message": "sidecar-dispatcher-unavailable"},
+        },
+        status_code=502,
+    )
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "maya_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_http_error"
+    assert result["http_status"] == 502
+    assert result["response"]["error"] == {"code": -32000, "message": "sidecar-dispatcher-unavailable"}
+
+
+@pytest.mark.parametrize("status_code", [200, 502], ids=["success", "http-error"])
+def test_probe_sidecar_tool_rejects_response_larger_than_one_mebibyte(status_code: int) -> None:
+    server, url, _requests, _headers = _start_probe_server(
+        {}, status_code=status_code, response_body=b"x" * ((1024 * 1024) + 1)
+    )
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "zbrush_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_response_too_large"
+    assert "response" not in result
+
+
+def test_probe_sidecar_tool_rejects_truncated_response_body() -> None:
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": {"success": True}},
+        content_length_delta=10,
+    )
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "maya_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_bad_response"
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "text/event-stream"], ids=["non-json", "sse"])
+def test_probe_sidecar_tool_rejects_non_json_response_content_type(content_type: str) -> None:
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": {}},
+        content_type=content_type,
+    )
+    try:
+        result = lifecycle.probe_sidecar_tool(url, "custom_diagnostics__ping", timeout_secs=2.0)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_bad_response"
+
+
+def test_sidecar_readiness_status_uses_probe_helper_with_a_valid_sidecar_response(tmp_path: Path) -> None:
+    server, url, _requests, _headers = _start_probe_server(
+        lambda request: {"jsonrpc": "2.0", "id": request["id"], "result": {"success": True}}
+    )
+    try:
+        registry = _write_ready_sidecar_registry(tmp_path)
+        services = json.loads((registry / "services.json").read_text(encoding="utf-8"))
+        services[0]["metadata"]["mcp_url"] = url
+        (registry / "services.json").write_text(json.dumps(services), encoding="utf-8")
+        result = lifecycle.sidecar_readiness_status(
+            registry,
+            dcc_type="maya",
+            probe_tool="maya_diagnostics__ping",
+            probe_timeout_secs=2.0,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is True
+    assert result["status"] == "ready"
+    assert result["probe"]["status"] == "probe_ok"
+
+
+def test_sidecar_readiness_status_surfaces_probe_transport_desync(tmp_path: Path) -> None:
+    server, url, _requests, _headers = _start_probe_server(
+        {"jsonrpc": "2.0", "id": "stale-response", "result": {"success": True}}
+    )
+    try:
+        registry = _write_ready_sidecar_registry(tmp_path)
+        services = json.loads((registry / "services.json").read_text(encoding="utf-8"))
+        services[0]["metadata"]["mcp_url"] = url
+        (registry / "services.json").write_text(json.dumps(services), encoding="utf-8")
+        result = lifecycle.sidecar_readiness_status(
+            registry,
+            dcc_type="maya",
+            probe_tool="maya_diagnostics__ping",
+            probe_timeout_secs=2.0,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result["success"] is False
+    assert result["status"] == "probe_transport_desync"
+    assert result["probe"]["status"] == "probe_transport_desync"
+    assert "request-id correlation" in result["recommended_next_action"]
 
 
 def test_sidecar_readiness_status_accepts_probe_success(
