@@ -207,6 +207,21 @@ class TestResolvedServerConfig:
         assert config.instance_metadata["dcc_mcp_server_version"] == "9.9.9"
         assert config.instance_metadata["dcc_mcp_instance_type"] == "gui"
 
+    def test_build_mcp_http_config_propagates_explicit_adapter_version(self, tmp_path):
+        opts = DccServerOptions.from_env(
+            "photoshop",
+            tmp_path,
+            adapter_version="1.2.3",
+        )
+
+        config = build_mcp_http_config(
+            opts,
+            package_version="9.9.9",
+            version_provider=lambda: "25.0",
+        )
+
+        assert config.adapter_version == "1.2.3"
+
     def test_build_mcp_http_config_propagates_standalone_main_thread(self, tmp_path):
         opts = DccServerOptions.from_env(
             "maya",

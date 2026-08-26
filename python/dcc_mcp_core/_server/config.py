@@ -224,6 +224,7 @@ def build_mcp_http_config(
         config.gateway_port = gateway.port
     if gateway.registry_dir:
         config.registry_dir = gateway.registry_dir
+    config.adapter_version = options.sidecar.adapter_version
 
     resolved_dcc_version = gateway.dcc_version if gateway.dcc_version is not None else version_provider()
     if resolved_dcc_version:
