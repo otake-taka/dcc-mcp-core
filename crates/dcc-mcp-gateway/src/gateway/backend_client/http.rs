@@ -79,16 +79,9 @@ pub(super) async fn rest_post_with_trace_context(
     request_id: Option<&str>,
     trace_context: Option<&TraceContext>,
 ) -> Result<Value, String> {
-    rest_post_response_with_trace_context(
-        client,
-        url,
-        body,
-        timeout,
-        request_id,
-        trace_context,
-    )
-    .await
-    .map(|response| response.body)
+    rest_post_response_with_trace_context(client, url, body, timeout, request_id, trace_context)
+        .await
+        .map(|response| response.body)
 }
 
 pub(super) struct RestPostResponse {

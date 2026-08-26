@@ -344,8 +344,7 @@ pub(crate) fn build_gateway_openapi_document(server_version: &str) -> Value {
         request_body_ref("GatewayDirectCallRequest"),
         gateway_response_ref("CallOutcome"),
     );
-    instance_call_operation["post"]["responses"]["202"] =
-        gateway_response_ref("CallOutcome");
+    instance_call_operation["post"]["responses"]["202"] = gateway_response_ref("CallOutcome");
     paths.insert(
         "/v1/dcc/{dcc_type}/instances/{instance_id}/call".to_string(),
         instance_call_operation,
