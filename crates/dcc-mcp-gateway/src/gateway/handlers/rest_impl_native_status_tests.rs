@@ -209,8 +209,8 @@ async fn gateway_call_routes_preserve_native_pending_status_and_traces() {
         "/v1/dcc/{dcc_type}/instances/{instance_id}/call",
     ] {
         assert_eq!(
-            openapi["paths"][path]["post"]["responses"]["202"]["content"]
-                ["application/json"]["schema"]["$ref"],
+            openapi["paths"][path]["post"]["responses"]["202"]["content"]["application/json"]["schema"]
+                ["$ref"],
             "#/components/schemas/CallOutcome"
         );
     }
